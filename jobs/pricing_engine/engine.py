@@ -93,6 +93,8 @@ def save_recommendations(path: str, run_id: str, week: str, rows: list[dict]) ->
 
 
 def record_send_results(path: str, run_id: str, week: str, results: list[dict]) -> None:
+    if not results:                                   # nothing was sent (e.g. rerun, all already accepted)
+        return
     con = duckdb.connect(path)
     try:
         con.executemany(

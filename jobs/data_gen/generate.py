@@ -1,10 +1,15 @@
 """Step 1: seeded synthetic data -> DuckDB. Fictional brands only.
 
-    python -m jobs.data_gen.generate [--seed 42] [--path data/warehouse.duckdb] [--skip-sap]
+    python -m jobs.data_gen.generate [--seed 42] [--path data/warehouse.duckdb]
+                                     [--force] [--skip-sap] [--skip-ingest]
 
-Ownership: SAP owns the weekly clearance list and business rules, so those two tables are
-seeded into mock-sap's Postgres (schema `sap`), not DuckDB. DuckDB holds the history; the
-`jobs.sap_ingest` job pulls the candidates/rules from SAP into DuckDB.
+Both stores keep the full history:
+  * SAP (mock-sap's Postgres, schema `sap`) owns the weekly clearance list, business rules and the
+    price conditions it holds: candidates + rules for W34-W39 and the published prices of W34-W38.
+    It also keeps an append-only submission_log of every record it receives.
+  * DuckDB holds sales and price history (W27-W38), inventory, products, and (via `jobs.sap_ingest`)
+    the candidates + rules of every week. The weekly pipeline appends each new week's outcome.
+This CLI is a FULL RESET of both stores, so it refuses to overwrite existing data without --force.
 
 Timeline (2026 ISO weeks):
     W27-W33  history, no clearance (shelf price = regular price, small random promos to W32)
@@ -31,7 +36,8 @@ An item is one `sku`; its pack sizes share that sku id and differ by `pack_qty` 
 the pack: 1, 6, 12) and `pack_type` ('Single' | 'Multipack'). The row key is (sku, pack_qty).
 
 Tables: weeks, products, stores, sales, price_history, inventory, clearance_candidates,
-business_rules, seed_manifest (planted W39 issues, used by tests and later scenarios).
+business_rules, price_conditions (SAP's published prices of past weeks), seed_manifest (planted W39
+issues, used by tests and later scenarios).
 """
 from __future__ import annotations
 
@@ -235,6 +241,16 @@ def build(seed: int = 42, max_clearance_weeks: int = MAX_CLEARANCE_WEEKS):
         (WEEK, "999999", "Single", 1, "NOT_IN_PRODUCTS", "candidate has no product master")],
         columns=["week", "sku", "pack_type", "pack_qty", "issue", "detail"])
 
+    # SAP holds the prices it published in the past weeks (W34-W38) as condition records
+    cond_rows = []
+    for h in price_history[price_history.is_clearance].itertuples(index=False):
+        n = int(h.week[-2:])
+        vf, vt = week_start(n), week_start(n) + timedelta(days=6)
+        cond_rows.append((f"SEED-{h.week}|{h.sku}|{h.pack_qty}|{h.region}|{vf}", f"SEED-{h.week}", h.week,
+                          h.sku, int(h.pack_qty), h.region, float(h.price), vf, vt))
+    price_conditions = pd.DataFrame(cond_rows, columns=[
+        "idem_key", "run_id", "week", "sku", "pack_qty", "region", "price", "valid_from", "valid_to"])
+
     weeks = pd.DataFrame(
         [(week_id(n), week_start(n),
           "history" if n < FIRST_CLEAR_N else "published" if n < CAND_WEEK_N else "open")
@@ -244,10 +260,10 @@ def build(seed: int = 42, max_clearance_weeks: int = MAX_CLEARANCE_WEEKS):
     return {"weeks": weeks, "products": products, "stores": stores, "sales": sales,
             "price_history": price_history, "inventory": inventory,
             "clearance_candidates": candidates, "business_rules": rules,
-            "seed_manifest": seed_manifest}
+            "price_conditions": price_conditions, "seed_manifest": seed_manifest}
 
 
-SAP_TABLES = ("clearance_candidates", "business_rules")
+SAP_TABLES = ("clearance_candidates", "business_rules", "price_conditions")
 
 
 def write(path: str, seed: int = 42, with_sap_tables: bool = False,
@@ -270,17 +286,54 @@ def write(path: str, seed: int = 42, with_sap_tables: bool = False,
     return counts
 
 
-if __name__ == "__main__":
+def _sap_has_data() -> bool:
+    from shared import db
+    from shared.sap_schema import schema
+    with db.connect() as con:
+        return con.execute("SELECT to_regclass(%s) AS t", (f"{schema()}.price_conditions",)).fetchone()["t"] is not None
+
+
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--path", default=os.environ.get("DUCKDB_PATH", "data/warehouse.duckdb"))
+    ap.add_argument("--force", action="store_true", help="overwrite existing DuckDB file / SAP data (full reset)")
     ap.add_argument("--skip-sap", action="store_true", help="do not seed mock-sap's Postgres")
-    args = ap.parse_args()
+    ap.add_argument("--skip-ingest", action="store_true", help="do not ingest W34-W39 from SAP into DuckDB")
+    args = ap.parse_args(argv)
+
+    if not args.force:
+        existing = [f"DuckDB file {args.path}"] if os.path.exists(args.path) else []
+        if not args.skip_sap and _sap_has_data():
+            existing.append("SAP schema in Postgres")
+        if existing:
+            print("Refusing to overwrite existing history: " + " and ".join(existing)
+                  + ".\nThis command is a full reset. Re-run with --force to wipe and regenerate.")
+            return 1
+
+    data = build(args.seed)
     print(f"DuckDB -> {args.path}")
-    for t, n in write(args.path, args.seed).items():
-        print(f"  {t:22s} {n:>8d}")
-    if not args.skip_sap:
-        from jobs.data_gen.seed_sap import seed_sap
-        print("SAP Postgres (schema sap)")
-        for t, n in seed_sap({k: v for k, v in build(args.seed).items() if k in SAP_TABLES}).items():
-            print(f"  {t:22s} {n:>8d}")
+    for name, n in write(args.path, args.seed).items():
+        print(f"  {name:22s} {n:>8d}")
+    if args.skip_sap:
+        return 0
+    from jobs.data_gen.seed_sap import seed_sap
+    print("SAP Postgres")
+    for name, n in seed_sap({k: v for k, v in data.items() if k in SAP_TABLES}).items():
+        print(f"  {name:22s} {n:>8d}")
+    if not args.skip_ingest:
+        import httpx
+
+        from jobs.sap_ingest import ALL_WEEKS, ingest, sap_client
+        try:
+            with sap_client() as c:
+                print("ingest SAP -> DuckDB (all weeks)")
+                for w in ALL_WEEKS:
+                    print(f"  {w}", ingest(c, w, args.path))
+        except httpx.HTTPError as e:
+            print(f"  mock-sap not reachable ({e!r}); start it and run: python -m jobs.sap_ingest --all-weeks")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

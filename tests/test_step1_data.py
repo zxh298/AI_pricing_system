@@ -3,7 +3,7 @@ import pytest
 
 import pandas as pd
 
-from jobs.data_gen.generate import WEEK, build, write
+from jobs.data_gen.generate import SAP_TABLES, WEEK, build, main, write
 from shared.warehouse import DuckDBWarehouse
 
 EPS = 1e-9
@@ -113,7 +113,7 @@ def test_sap_tables_not_in_duckdb_by_default(tmp_path):
     path = str(tmp_path / "w.duckdb")
     write(path, seed=1)
     tables = {r[0] for r in q(path, "SHOW TABLES")}
-    assert "clearance_candidates" not in tables and "business_rules" not in tables
+    assert not set(SAP_TABLES) & tables
     assert {"products", "sales", "price_history", "inventory", "weeks", "seed_manifest"} <= tables
 
 
@@ -177,3 +177,27 @@ def test_items_removed_after_max_weeks_but_kept_in_history():
     assert ph.week.nunique() == 12 and ph.is_clearance.any()
     assert {(s, p) for s, p in zip(d["sales"].sku, d["sales"].pack_qty)} >= keys
     assert set(d["business_rules"].max_clearance_weeks) == {3}
+
+
+def test_sap_holds_past_weeks_prices(db):
+    """price_conditions (SAP-owned) carries the published price of every clearance item of W34-W38."""
+    assert set(SAP_TABLES) == {"clearance_candidates", "business_rules", "price_conditions"}
+    assert q(db, "SELECT count(*) FROM price_conditions")[0][0] == \
+        q(db, "SELECT count(*) FROM price_history WHERE is_clearance")[0][0]
+    assert q(db, "SELECT count(DISTINCT week) FROM price_conditions")[0][0] == 5
+    assert q(db, """SELECT count(*) FROM price_conditions c JOIN price_history h
+        ON h.week = c.week AND h.sku = c.sku AND h.pack_qty = c.pack_qty AND h.region = c.region
+        WHERE abs(c.price - h.price) > 1e-9""")[0][0] == 0
+    # each record is valid for its own Monday-Sunday only, so W39 prices never overlap them
+    assert q(db, "SELECT count(*) FROM price_conditions WHERE valid_to - valid_from <> 6 OR valid_to >= DATE '2026-09-21'"
+             )[0][0] == 0
+
+
+def test_cli_refuses_to_overwrite_without_force(tmp_path, capsys):
+    path = str(tmp_path / "w.duckdb")
+    assert main(["--path", path, "--skip-sap", "--skip-ingest"]) == 0
+    before = q(path, "SELECT count(*) FROM sales")
+    assert main(["--path", path, "--skip-sap", "--skip-ingest"]) == 1       # existing history: refuse
+    assert "Refusing to overwrite" in capsys.readouterr().out
+    assert q(path, "SELECT count(*) FROM sales") == before
+    assert main(["--path", path, "--skip-sap", "--skip-ingest", "--force"]) == 0

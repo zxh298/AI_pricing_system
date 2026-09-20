@@ -15,6 +15,7 @@ import httpx
 
 from shared.config import load_config
 
+ALL_WEEKS = [f"2026-W{n}" for n in range(34, 40)]      # weeks SAP holds a clearance list for
 CAND_COLS = ["week", "sku", "pack_type", "pack_qty", "region", "shelf_price", "week_no", "current_price"]
 RULE_COLS = ["week", "sku", "pack_type", "pack_qty", "price_floor", "max_markdown_pct",
              "max_clearance_weeks", "rule_version"]
@@ -44,8 +45,10 @@ def ingest(client: httpx.Client, week: str, duckdb_path: str) -> dict[str, int]:
         con.execute(DDL)
         con.execute("DELETE FROM clearance_candidates WHERE week = ?", [week])
         con.execute("DELETE FROM business_rules WHERE week = ?", [week])
-        con.executemany(f"INSERT INTO clearance_candidates VALUES ({','.join('?' * len(CAND_COLS))})", cands)
-        con.executemany(f"INSERT INTO business_rules VALUES ({','.join('?' * len(RULE_COLS))})", rules)
+        if cands:
+            con.executemany(f"INSERT INTO clearance_candidates VALUES ({','.join('?' * len(CAND_COLS))})", cands)
+        if rules:
+            con.executemany(f"INSERT INTO business_rules VALUES ({','.join('?' * len(RULE_COLS))})", rules)
     finally:
         con.close()
     return {"candidates": len(cands), "rules": len(rules), "candidates_without_rule": len(cands) - sum(
@@ -62,7 +65,7 @@ if __name__ == "__main__":
     ap.add_argument("--week", default="2026-W39")
     ap.add_argument("--all-weeks", action="store_true")
     args = ap.parse_args()
-    weeks = [f"2026-W{n}" for n in range(34, 40)] if args.all_weeks else [args.week]
+    weeks = ALL_WEEKS if args.all_weeks else [args.week]
     path = load_config().duckdb_path
     with sap_client() as c:
         for w in weeks:

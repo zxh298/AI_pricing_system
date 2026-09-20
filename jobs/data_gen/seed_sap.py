@@ -1,6 +1,6 @@
-"""Load the SAP-owned tables (candidates, rules) into mock-sap's Postgres schema.
+"""Load the SAP-owned tables (candidates, rules, past weeks' price conditions) into mock-sap's Postgres schema.
 
-Drops received price conditions too, so a re-seed gives SAP a clean slate.
+Drops the whole SAP schema first (received prices and the submission log too): a full reset.
 """
 from __future__ import annotations
 
@@ -16,7 +16,9 @@ def seed_sap(tables: dict[str, pd.DataFrame], database_url: str | None = None) -
     with db.connect(database_url) as con:
         con.execute(f"DROP SCHEMA IF EXISTS {s} CASCADE")
         con.execute(ddl())
-        for name in ("clearance_candidates", "business_rules"):
+        for name in ("clearance_candidates", "business_rules", "price_conditions"):
+            if name not in tables:
+                continue
             df = tables[name]
             cols = list(df.columns)
             sql = f"INSERT INTO {s}.{name} ({', '.join(cols)}) VALUES ({', '.join(['%s'] * len(cols))})"

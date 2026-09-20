@@ -23,9 +23,31 @@ services:
       DATABASE_URL: postgresql://pricing:pricing@postgres:5432/pricing
       SAP_READ_KEY: ${SAP_READ_KEY:-dev-read-key}
       SAP_WRITE_KEY: ${SAP_WRITE_KEY:-dev-write-key}
+      # fault injection, off by default (restart the container to change):
+      SAP_FAULT_FAIL_FIRST_N: ${SAP_FAULT_FAIL_FIRST_N:-0}
+      SAP_FAULT_429_RATE: ${SAP_FAULT_429_RATE:-0}
+      SAP_FAULT_5XX_RATE: ${SAP_FAULT_5XX_RATE:-0}
+      SAP_FAULT_SEED: ${SAP_FAULT_SEED:-1}
+      SAP_FAULT_RETRY_AFTER: ${SAP_FAULT_RETRY_AFTER:-1}
     ports: ["8001:8001"]
     depends_on:
       postgres: {condition: service_healthy}
+
+  # Batch job: docker compose run --rm weekly-pipeline --week 2026-W39
+  weekly-pipeline:
+    profiles: [jobs]
+    build:
+      context: .
+      dockerfile: jobs/weekly_pipeline/Dockerfile
+    environment:
+      DATABASE_URL: postgresql://pricing:pricing@postgres:5432/pricing
+      SAP_BASE_URL: http://mock-sap:8001
+      SAP_READ_KEY: ${SAP_READ_KEY:-dev-read-key}
+      SAP_WRITE_KEY: ${SAP_WRITE_KEY:-dev-write-key}
+      DUCKDB_PATH: /data/warehouse.duckdb     # BigQuery on GCP (WAREHOUSE=bigquery)
+    volumes: ["./data:/data"]
+    depends_on:
+      mock-sap: {condition: service_started}
 
 volumes:
   pgdata:

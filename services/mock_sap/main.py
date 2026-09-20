@@ -5,12 +5,23 @@
     GET  /pricing/conditions?week=     prices SAP currently holds                (read or write key)
     GET  /healthz
 
+Fault injection on POST /pricing/markdown-prices (env vars, read on every request):
+    SAP_FAULT_FAIL_FIRST_N=2    the first N POST requests answer 503
+    SAP_FAULT_429_RATE=0.3      fraction of POST requests answered 429 (Retry-After header)
+    SAP_FAULT_5XX_RATE=0.2      fraction of POST requests answered 503
+    SAP_FAULT_SEED=1            seed for the random faults
+    SAP_FAULT_RETRY_AFTER=1     seconds advertised in Retry-After
+Promotions (table promotions) override a markdown: SAP accepts the price, but the *effective*
+price in GET /pricing/conditions is the promotion price (accepted != effective).
+
 SAP-side validation is deliberately thin (format, article on list, validity overlap). Business
 rules (floor, markdown cap, ladder) are the pricing engine's job; reconciliation catches the rest.
 """
 from __future__ import annotations
 
+import json
 import os
+import random
 from datetime import date
 from decimal import Decimal, InvalidOperation
 
@@ -49,6 +60,39 @@ def require_write(x_api_key: str | None = Header(default=None)) -> str:
     if x_api_key != write:
         raise HTTPException(403, "write key required")
     return x_api_key
+
+
+# ---------------- fault injection (POST only) ----------------
+_post_calls = 0
+_rng = random.Random()
+_rng_seed = None
+
+
+def reset_faults() -> None:
+    """Restart the injected-fault counters (used by tests)."""
+    global _post_calls, _rng, _rng_seed
+    _post_calls, _rng_seed = 0, None
+    _rng = random.Random()
+
+
+def _maybe_inject_fault() -> None:
+    global _post_calls, _rng, _rng_seed
+    _post_calls += 1
+    if _post_calls <= int(os.environ.get("SAP_FAULT_FAIL_FIRST_N", "0")):
+        raise HTTPException(503, "injected fault: service unavailable")
+    r429 = float(os.environ.get("SAP_FAULT_429_RATE", "0"))
+    r5xx = float(os.environ.get("SAP_FAULT_5XX_RATE", "0"))
+    if r429 <= 0 and r5xx <= 0:
+        return
+    seed = os.environ.get("SAP_FAULT_SEED")
+    if seed != _rng_seed:
+        _rng, _rng_seed = random.Random(seed), seed
+    x = _rng.random()
+    if x < r429:
+        raise HTTPException(429, "injected fault: too many requests",
+                            headers={"Retry-After": os.environ.get("SAP_FAULT_RETRY_AFTER", "1")})
+    if x < r429 + r5xx:
+        raise HTTPException(503, "injected fault: service unavailable")
 
 
 @app.get("/healthz")
@@ -104,6 +148,7 @@ def _validate(rec: dict) -> tuple[dict | None, tuple[str, str] | None]:
 
 @app.post("/pricing/markdown-prices", dependencies=[Depends(require_write)])
 async def post_prices(request: Request):
+    _maybe_inject_fault()
     try:
         body = await request.json()
         run_id, week, prices = str(body["run_id"]), str(body["week"]), body["prices"]
@@ -159,6 +204,17 @@ async def post_prices(request: Request):
                 (idem, run_id, week, c["sku"], c["pack_qty"], c["region"], c["price"], c["valid_from"], c["valid_to"]))
             results.append({**ident, "status": "ACCEPTED", "code": "OK", "message": "accepted", "duplicate": False})
 
+        # append-only submission log: every received record, whatever its outcome
+        with con.cursor() as cur:
+            cur.executemany(
+                f"""INSERT INTO {s}.submission_log
+                    (run_id, week, sku, pack_qty, region, status, code, message, duplicate, payload)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                [(run_id, week, None if r["sku"] is None else str(r["sku"]),
+                  None if r["pack_qty"] is None else str(r["pack_qty"]), r["region"],
+                  r["status"], r["code"], r["message"], r["duplicate"], json.dumps(rec, default=str))
+                 for rec, r in zip(prices, results)])
+
     accepted = sum(r["status"] == "ACCEPTED" for r in results)
     return {"run_id": run_id, "week": week,
             "summary": {"received": len(results), "accepted": accepted,
@@ -170,8 +226,17 @@ async def post_prices(request: Request):
 # ---------------- GET conditions ----------------
 @app.get("/pricing/conditions", dependencies=[Depends(require_read)])
 def conditions(week: str = Query(..., pattern=r"^\d{4}-W\d{2}$")):
+    """Prices SAP holds. `price` is what we sent; `effective_price` is what shoppers pay:
+    a promotion for the same item and region overrides the markdown."""
+    s = schema()
     with db.connect() as con:
         rows = con.execute(f"""
-            SELECT run_id, week, sku, pack_qty, region, price::float AS price, valid_from, valid_to
-            FROM {schema()}.price_conditions WHERE week = %s ORDER BY sku, pack_qty, region""", (week,)).fetchall()
+            SELECT c.run_id, c.week, c.sku, c.pack_qty, c.region, c.price::float AS price,
+                   COALESCE(p.promo_price, c.price)::float AS effective_price,
+                   CASE WHEN p.promo_price IS NULL THEN 'MARKDOWN' ELSE 'PROMOTION' END AS effective_source,
+                   c.valid_from, c.valid_to
+            FROM {s}.price_conditions c
+            LEFT JOIN {s}.promotions p
+                   ON p.week = c.week AND p.sku = c.sku AND p.pack_qty = c.pack_qty AND p.region = c.region
+            WHERE c.week = %s ORDER BY c.sku, c.pack_qty, c.region""", (week,)).fetchall()
     return {"week": week, "count": len(rows), "items": rows}

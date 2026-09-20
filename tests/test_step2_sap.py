@@ -35,13 +35,13 @@ def sap():
 
 @pytest.fixture(autouse=True)
 def clean_conditions():
-    """Each test starts with no received prices (candidates/rules stay seeded)."""
+    """Each test starts with no W39 prices received (candidates, rules and past weeks' prices stay)."""
     from shared.sap_schema import schema
     with db.connect() as c:
         c.execute(f"CREATE SCHEMA IF NOT EXISTS {schema()}")
         exists = c.execute("SELECT to_regclass(%s) AS t", (f"{schema()}.price_conditions",)).fetchone()["t"]
         if exists:
-            c.execute(f"TRUNCATE {schema()}.price_conditions")
+            c.execute(f"DELETE FROM {schema()}.price_conditions WHERE week = %s", (WEEK,))
 
 
 def hdr(k):
@@ -122,3 +122,25 @@ def test_ingest_then_price_and_send(sap, tmp_path):
     con = duckdb.connect(path, read_only=True)
     assert con.execute("SELECT count(*) FROM price_recommendations WHERE sap_status = 'ACCEPTED'").fetchone()[0] == 126
     con.close()
+
+
+def test_sap_keeps_past_weeks_and_a_full_submission_log(sap):
+    from shared.sap_schema import schema
+    past = sap.get("/pricing/conditions", params={"week": "2026-W38"}, headers=hdr("rk")).json()
+    assert past["count"] > 0 and {i["run_id"] for i in past["items"]} == {"SEED-2026-W38"}
+
+    items = sap.get("/clearance/candidates", params={"week": WEEK}, headers=hdr("rk")).json()["items"]
+    a = next(i for i in items if i["price_floor"] is not None)
+    body = {"run_id": "run-log", "week": WEEK, "prices": [
+        rec(a["sku"], a["pack_qty"], a["region"], round(a["current_price"] * 0.9, 2)),
+        rec(a["sku"], a["pack_qty"], a["region"], -1.0, vf="2026-09-22"),        # bad format
+        {"sku": "x"}]}
+    sap.post("/pricing/markdown-prices", json=body, headers=hdr("wk"))
+    sap.post("/pricing/markdown-prices", json=body, headers=hdr("wk"))          # replay
+    with db.connect() as c:
+        log = c.execute(f"SELECT status, code, duplicate, payload FROM {schema()}.submission_log "
+                        "WHERE run_id = 'run-log' ORDER BY id").fetchall()
+    assert [(r["code"], r["duplicate"]) for r in log] == [
+        ("OK", False), ("BAD_FORMAT", False), ("BAD_FORMAT", False),
+        ("OK", True), ("BAD_FORMAT", False), ("BAD_FORMAT", False)]            # rejected + replayed kept, nothing overwritten
+    assert log[0]["payload"]["sku"] == a["sku"] and log[2]["payload"] == {"sku": "x"}

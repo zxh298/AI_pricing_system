@@ -1,7 +1,9 @@
 """Tables owned by the (mock) SAP system, kept in their own Postgres schema.
 
-SAP is the source of truth for the weekly clearance list and business rules. The schema
-name comes from SAP_SCHEMA so tests can use a throwaway schema.
+SAP is the source of truth for the weekly clearance list and business rules, and keeps the full
+history: candidates + rules for every week, price_conditions (accepted prices, past weeks
+seeded), and an append-only submission_log of every record it ever received (accepted, rejected,
+replayed). The schema name comes from SAP_SCHEMA so tests can use a throwaway schema.
 """
 import os
 
@@ -30,6 +32,16 @@ CREATE TABLE IF NOT EXISTS {s}.price_conditions (
     region TEXT NOT NULL, price NUMERIC(10,2) NOT NULL,
     valid_from DATE NOT NULL, valid_to DATE NOT NULL,
     received_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS {s}.submission_log (
+    id BIGSERIAL PRIMARY KEY, received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    run_id TEXT NOT NULL, week TEXT NOT NULL, sku TEXT, pack_qty TEXT, region TEXT,
+    status TEXT NOT NULL, code TEXT NOT NULL, message TEXT, duplicate BOOLEAN NOT NULL DEFAULT false,
+    payload JSONB);
+CREATE INDEX IF NOT EXISTS submission_log_run ON {s}.submission_log (run_id);
+CREATE TABLE IF NOT EXISTS {s}.promotions (
+    week TEXT NOT NULL, sku TEXT NOT NULL, pack_qty INT NOT NULL, region TEXT NOT NULL,
+    promo_price NUMERIC(10,2) NOT NULL, promo_name TEXT NOT NULL,
+    PRIMARY KEY (week, sku, pack_qty, region));
 CREATE INDEX IF NOT EXISTS price_conditions_item
     ON {s}.price_conditions (sku, pack_qty, region);
 """
