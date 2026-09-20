@@ -68,8 +68,8 @@ def test_candidates_with_rules(sap):
                                                         "price_floor", "max_markdown_pct", "rule_version",
                                                         "shelf_price", "week_no", "max_clearance_weeks"}
     ruled = [i for i in r["items"] if i["price_floor"] is not None]
-    assert all(i["max_markdown_pct"] == 0.5 and i["max_clearance_weeks"] == 20 for i in ruled)
-    assert all(1 <= i["week_no"] <= 20 and i["shelf_price"] >= i["current_price"] for i in r["items"])
+    assert all(i["max_markdown_pct"] == 0.5 and i["max_clearance_weeks"] == 10 for i in ruled)
+    assert all(1 <= i["week_no"] <= 10 and i["shelf_price"] >= i["current_price"] for i in r["items"])
     assert sum(i["price_floor"] is None for i in r["items"]) == 3 * 2 + 3      # 2 missing rules + orphan, x3 regions
     assert sap.get("/clearance/candidates", params={"week": "2030-W01"}, headers=hdr("rk")).status_code == 404
 
@@ -102,9 +102,9 @@ def test_malformed_body(sap):
     assert sap.post("/pricing/markdown-prices", json={"nope": 1}, headers=hdr("wk")).status_code == 400
 
 
-def test_ingest_and_stub_sender(sap, tmp_path):
+def test_ingest_then_price_and_send(sap, tmp_path):
+    from jobs.pricing_engine.run import run
     from jobs.sap_ingest import ingest
-    from jobs.stub_sender import build_prices, send
     path = str(tmp_path / "w.duckdb")
     write(path, seed=1)
     sap.headers.update(hdr("wk"))
@@ -115,50 +115,10 @@ def test_ingest_and_stub_sender(sap, tmp_path):
     assert con.execute("SELECT count(*) FROM clearance_candidates").fetchone()[0] == 138
     con.close()
 
-    wh = DuckDBWarehouse(path)
-    prices, skipped = build_prices(WEEK, 0.10, wh)
-    assert {s["reason"] for s in skipped} == {"MISSING_RULE", "FLOOR_ABOVE_PRICE"}
-    cands = {(c["sku"], c["pack_qty"], c["region"]): c for c in wh.get_candidates(WEEK)}
-    rules = {(r["sku"], r["pack_qty"]): r for r in wh.get_rules(WEEK)}
-    price = {(p["sku"], p["pack_qty"], p["region"]): p["markdown_price"] for p in prices}
-    for k, p in price.items():                                              # stub obeys the hard constraints
-        assert p <= cands[k]["current_price"] + 1e-9                       # never above last week
-        assert p >= rules[k[:2]]["price_floor"] - 1e-9
-        assert p >= 0.5 * cands[k]["shelf_price"] - 0.01                   # never below 50% off shelf price
-        if k[1] > 1 and (k[0], 1, k[2]) in price:                           # multipack per-item >= Single
-            assert p / k[1] >= price[(k[0], 1, k[2])] - 1e-9
-    results = send(sap, WEEK, "stub-run", prices, batch_size=20)
-    assert len(results) == len(prices) and all(r["status"] == "ACCEPTED" for r in results)
-
-
-def test_stub_sender_skips_items_past_max_weeks():
-    from jobs.stub_sender import build_prices
-
-    class FakeWH:
-        def get_candidates(self, week):
-            base = dict(week=week, sku="1", pack_type="Single", pack_qty=1, region="VIC",
-                        shelf_price=20.0, current_price=15.0, cost=5.0)
-            return [base | {"sku": "1", "week_no": 20}, base | {"sku": "2", "week_no": 21}]
-
-        def get_rules(self, week):
-            return [dict(sku=s, pack_qty=1, price_floor=6.0, max_markdown_pct=0.5, max_clearance_weeks=20)
-                    for s in ("1", "2")]
-
-    prices, skipped = build_prices(WEEK, 0.10, FakeWH())
-    assert [p["sku"] for p in prices] == ["1"] and prices[0]["markdown_price"] == 13.5
-    assert skipped == [{"sku": "2", "pack_qty": 1, "region": "VIC", "reason": "EXCEEDED_MAX_WEEKS"}]
-
-
-def test_stub_sender_price_floor_beats_half_off():
-    from jobs.stub_sender import build_prices
-
-    class FakeWH:
-        def get_candidates(self, week):
-            return [dict(week=week, sku="1", pack_type="Single", pack_qty=1, region="VIC", shelf_price=20.0,
-                         week_no=5, current_price=11.0, cost=8.0)]
-
-        def get_rules(self, week):        # floor 10.50 is above 50% of shelf (10.00): floor wins
-            return [dict(sku="1", pack_qty=1, price_floor=10.5, max_markdown_pct=0.5, max_clearance_weeks=20)]
-
-    prices, _ = build_prices(WEEK, 0.50, FakeWH())
-    assert prices[0]["markdown_price"] == 10.5
+    rows, results = run(WEEK, "run-e2e", DuckDBWarehouse(path), path, client=sap, batch_size=20)
+    priced = [r for r in rows if r["status"] == "PRICED"]
+    assert len(rows) == 138 and len(results) == len(priced) == 126
+    assert all(r["status"] == "ACCEPTED" for r in results)
+    con = duckdb.connect(path, read_only=True)
+    assert con.execute("SELECT count(*) FROM price_recommendations WHERE sap_status = 'ACCEPTED'").fetchone()[0] == 126
+    con.close()

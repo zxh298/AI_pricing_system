@@ -18,8 +18,10 @@ Hard constraints baked into the generated history (and to be enforced by the rul
        same sku in the same week and region.
     3. Price >= max(SAP floor, shelf_price * (1 - max_markdown_pct)); max_markdown_pct is 0.5,
        so no price is below 50% off the full (shelf) price. The floor wins if it is higher.
-    4. An item is on the list for at most max_clearance_weeks (20) consecutive weeks. After its
-       week 20 SAP stops listing it; it gets no new price but stays in the history tables.
+    4. An item is on the list for at most max_clearance_weeks (10) consecutive weeks. After its
+       week 10 SAP stops listing it; it gets no new price but stays in the history tables.
+    Markdown schedule (shared/pricing_rules.py): week_no 1 = no discount, then +5 points of
+    shelf price per week (week 2 = 5% off ... week 10 = 45% off), subject to the rules above.
     Simplification: a SKU that leaves the candidate list keeps its last shelf price.
 
 `shelf_price` is the full price before any markdown. `week_no` is the nth consecutive week an
@@ -34,13 +36,14 @@ business_rules, seed_manifest (planted W39 issues, used by tests and later scena
 from __future__ import annotations
 
 import argparse
-import math
 import os
 from datetime import date, timedelta
 
 import duckdb
 import numpy as np
 import pandas as pd
+
+from shared.pricing_rules import recommend
 
 CAND_WEEK_N = 39                  # the week to be priced next
 WEEK = f"2026-W{CAND_WEEK_N}"
@@ -56,7 +59,7 @@ PACKS = [(6, 20), (12, 8)]        # (pack_qty, how many singles get a pack of th
 CAND_TARGET = {34: 20, 35: 28, 36: 34, 37: 38, 38: 42, 39: 45}
 FLOOR_MARGIN = 1.05               # SAP floor = cost * 1.05
 MAX_MARKDOWN = 0.5                # cumulative, vs shelf price (no price below 50% off)
-MAX_CLEARANCE_WEEKS = 20          # SAP stops listing an item after this many weeks
+MAX_CLEARANCE_WEEKS = 10          # SAP stops listing an item after this many weeks
 
 
 def pack_type(qty: int) -> str:
@@ -69,10 +72,6 @@ def week_id(n: int) -> str:
 
 def week_start(n: int) -> date:
     return WEEK_START - timedelta(days=7 * (CAND_WEEK_N - n))
-
-
-def cents_ceil(x: float) -> float:
-    return math.ceil(round(x * 100, 6)) / 100
 
 
 def build(seed: int = 42, max_clearance_weeks: int = MAX_CLEARANCE_WEEKS):
@@ -162,15 +161,12 @@ def build(seed: int = 42, max_clearance_weeks: int = MAX_CLEARANCE_WEEKS):
             rule_rows.append((wk, *k, floor[k], MAX_MARKDOWN, max_clearance_weeks, f"SAP-R-{wk}"))
         if n == CAND_WEEK_N:
             break
-        # --- price the members (singles first: a pack depends on its single's price) ---
+        # --- price the members by the schedule (singles first: a pack depends on its single) ---
         for k in sorted(members, key=lambda x: (x[1] > 1, x)):
             for r in REGIONS:
-                prev = cur[(k, r)]
-                lo = max(floor[k], shelf[k] * (1 - MAX_MARKDOWN))
-                if k[1] > 1:      # per-item price not below the Single's price this week
-                    lo = max(lo, round(k[1] * cur[((k[0], 1), r)], 2))
-                cur[(k, r)] = min(prev, max(round(prev * rng.uniform(0.85, 0.97), 2),
-                                            cents_ceil(lo)))
+                ladder = round(k[1] * cur[((k[0], 1), r)], 2) if k[1] > 1 else None
+                cur[(k, r)] = recommend(shelf[k], wkno[n][k], cur[(k, r)], floor[k],
+                                        MAX_MARKDOWN, ladder)["price"]
         for key, v in cur.items():
             ph[key].append(v)
 

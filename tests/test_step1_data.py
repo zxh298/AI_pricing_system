@@ -91,8 +91,9 @@ def test_w39_current_price_is_w38_price(db):
 def test_warehouse_queries_and_planted_issues(db):
     wh = DuckDBWarehouse(db)
     cands = wh.get_candidates(WEEK)
-    assert cands and all(c["sku"] != "999999" for c in cands)     # inner join drops orphan
-    assert len({(c["sku"], c["pack_qty"]) for c in cands}) == 45
+    orphan = [c for c in cands if c["name"] is None]               # candidate with no product master
+    assert {c["sku"] for c in orphan} == {"999999"} and len(orphan) == 3
+    assert len({(c["sku"], c["pack_qty"]) for c in cands if c["name"] is not None}) == 45
     skus = sorted({c["sku"] for c in cands})[:3]
     assert wh.get_sales_history(skus, "VIC") and wh.get_inventory(skus, WEEK)
     assert wh.get_price_history(skus) and wh.get_products(skus)
@@ -145,8 +146,18 @@ def test_week_no_counts_consecutive_weeks_from_one():
 def test_price_never_below_half_of_shelf_price(db):
     assert q(db, "SELECT count(*) FROM price_history WHERE is_clearance AND price < shelf_price * 0.5 - 0.01"
              )[0][0] == 0
+
+
+def test_history_follows_the_markdown_schedule(db):
+    # week_no 1 = shelf price; later weeks step down 5 points, unless the floor / ladder binds
+    assert q(db, "SELECT count(*) FROM price_history WHERE week_no = 1 AND abs(price - shelf_price) > 1e-9"
+             )[0][0] == 0
+    assert q(db, """SELECT count(*) FROM price_history h JOIN business_rules r
+        ON r.sku = h.sku AND r.pack_qty = h.pack_qty AND r.week = h.week
+        WHERE h.pack_qty = 1 AND h.week_no > 1 AND h.price > round(h.shelf_price * (1 - 0.05 * (h.week_no - 1)), 2) + 0.011
+        """)[0][0] == 0
     assert q(db, "SELECT min(max_markdown_pct), max(max_markdown_pct), min(max_clearance_weeks) "
-                 "FROM business_rules")[0] == (0.5, 0.5, 20)
+                 "FROM business_rules")[0] == (0.5, 0.5, 10)
 
 
 def test_items_removed_after_max_weeks_but_kept_in_history():
