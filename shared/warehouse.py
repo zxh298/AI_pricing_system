@@ -49,7 +49,7 @@ class DuckDBWarehouse(WarehouseClient):
     def get_candidates(self, week):
         return self._rows(
             "SELECT c.week, c.sku, c.pack_type, c.pack_qty, p.brand, p.category, p.name,"
-            " p.base_price, p.cost, c.current_price, c.region"
+            " c.shelf_price, c.week_no, p.cost, c.current_price, c.region"
             " FROM clearance_candidates c JOIN products p USING (sku, pack_qty) WHERE c.week = ?"
             " ORDER BY c.sku, c.pack_qty, c.region", [week])
 

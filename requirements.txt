@@ -4,3 +4,7 @@ pandas
 pytest
 ipykernel
 matplotlib
+fastapi
+uvicorn
+httpx
+psycopg[binary]

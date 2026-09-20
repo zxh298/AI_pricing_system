@@ -12,6 +12,8 @@ class Config:
     sap_base_url: str
     auth_mode: str
     llm_provider: str
+    sap_read_key: str
+    sap_write_key: str
 
 
 def load_config() -> Config:
@@ -24,4 +26,6 @@ def load_config() -> Config:
         sap_base_url=e("SAP_BASE_URL", "http://localhost:8001"),
         auth_mode=e("AUTH_MODE", "none"),
         llm_provider=e("LLM_PROVIDER", "scripted"),
+        sap_read_key=e("SAP_READ_KEY", "dev-read-key"),
+        sap_write_key=e("SAP_WRITE_KEY", "dev-write-key"),
     )

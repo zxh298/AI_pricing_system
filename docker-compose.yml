@@ -1,0 +1,31 @@
+# Local stack. Same images/env-var contract as Cloud Run; only values differ.
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: pricing
+      POSTGRES_PASSWORD: pricing
+      POSTGRES_DB: pricing
+    ports: ["5432:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pricing -d pricing"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
+  mock-sap:
+    build:
+      context: .
+      dockerfile: services/mock_sap/Dockerfile
+    environment:
+      PORT: "8001"
+      DATABASE_URL: postgresql://pricing:pricing@postgres:5432/pricing
+      SAP_READ_KEY: ${SAP_READ_KEY:-dev-read-key}
+      SAP_WRITE_KEY: ${SAP_WRITE_KEY:-dev-write-key}
+    ports: ["8001:8001"]
+    depends_on:
+      postgres: {condition: service_healthy}
+
+volumes:
+  pgdata:
