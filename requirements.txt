@@ -2,3 +2,5 @@ duckdb
 numpy
 pandas
 pytest
+ipykernel
+matplotlib

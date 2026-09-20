@@ -23,6 +23,12 @@ class WarehouseClient(ABC):
     def get_sales_history(self, skus: list[str], region: str | None = None) -> list[dict]: ...
 
     @abstractmethod
+    def get_price_history(self, skus: list[str], region: str | None = None) -> list[dict]: ...
+
+    @abstractmethod
+    def get_products(self, skus: list[str]) -> list[dict]: ...
+
+    @abstractmethod
     def get_inventory(self, skus: list[str], week: str) -> list[dict]: ...
 
 
@@ -42,32 +48,53 @@ class DuckDBWarehouse(WarehouseClient):
 
     def get_candidates(self, week):
         return self._rows(
-            "SELECT c.week, c.sku, p.brand, p.category, p.name, p.pack_size, p.cost,"
-            " c.current_price, c.region"
-            " FROM clearance_candidates c JOIN products p USING (sku) WHERE c.week = ?"
-            " ORDER BY c.sku, c.region", [week])
+            "SELECT c.week, c.sku, c.pack_type, c.pack_qty, p.brand, p.category, p.name,"
+            " p.base_price, p.cost, c.current_price, c.region"
+            " FROM clearance_candidates c JOIN products p USING (sku, pack_qty) WHERE c.week = ?"
+            " ORDER BY c.sku, c.pack_qty, c.region", [week])
 
     def get_rules(self, week):
-        return self._rows("SELECT * FROM business_rules WHERE week = ? ORDER BY sku", [week])
+        return self._rows(
+            "SELECT * FROM business_rules WHERE week = ? ORDER BY sku, pack_qty", [week])
 
     def get_sales_history(self, skus, region=None):
         if not skus:
             return []
         marks = ",".join("?" * len(skus))
-        sql = (f"SELECT sale_date, sku, region, SUM(units) AS units, AVG(price) AS avg_price"
+        sql = (f"SELECT sale_date, sku, pack_type, pack_qty, region, SUM(units) AS units,"
+               f" AVG(price) AS avg_price"
                f" FROM sales WHERE sku IN ({marks})")
         params: list = list(skus)
         if region:
             sql += " AND region = ?"
             params.append(region)
-        return self._rows(sql + " GROUP BY sale_date, sku, region ORDER BY sale_date", params)
+        return self._rows(
+            sql + " GROUP BY sale_date, sku, pack_type, pack_qty, region ORDER BY sale_date", params)
+
+    def get_price_history(self, skus, region=None):
+        if not skus:
+            return []
+        marks = ",".join("?" * len(skus))
+        sql = f"SELECT * FROM price_history WHERE sku IN ({marks})"
+        params: list = list(skus)
+        if region:
+            sql += " AND region = ?"
+            params.append(region)
+        return self._rows(sql + " ORDER BY sku, pack_qty, region, week", params)
+
+    def get_products(self, skus):
+        if not skus:
+            return []
+        marks = ",".join("?" * len(skus))
+        return self._rows(f"SELECT * FROM products WHERE sku IN ({marks}) ORDER BY sku, pack_qty", list(skus))
 
     def get_inventory(self, skus, week):
         if not skus:
             return []
         marks = ",".join("?" * len(skus))
         return self._rows(
-            f"SELECT * FROM inventory WHERE week = ? AND sku IN ({marks}) ORDER BY sku, region",
+            f"SELECT * FROM inventory WHERE week = ? AND sku IN ({marks})"
+            f" ORDER BY sku, pack_qty, region",
             [week, *skus])
 
 
@@ -82,6 +109,7 @@ class BigQueryWarehouse(WarehouseClient):
         raise NotImplementedError("BigQueryWarehouse is implemented in the GCP deployment step")
 
     get_candidates = get_rules = get_sales_history = get_inventory = _todo
+    get_price_history = get_products = _todo
 
 
 def get_warehouse(cfg: Config | None = None, read_only: bool = True) -> WarehouseClient:
