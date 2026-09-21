@@ -56,6 +56,14 @@ CONDITION_FIELDS = {
 }
 
 
+# Shown to the model with get_findings results, so a person and a team are not confused.
+FINDING_FIELDS = {
+    "owning_team": "the team responsible for fixing it, as entered by the person who recorded the finding",
+    "confirmed_by": "the person who verified the finding; not the owning team",
+    "ticket": "the tracking ticket, if there is one",
+}
+
+
 class ToolError(Exception):
     """A problem with the request itself; the message goes back to the LLM."""
 
@@ -271,9 +279,10 @@ def get_findings(ctx: ToolContext, week: str, region: str | None = None, error_c
     return {"as_of": _as_of(), "week": week, "count": len(rows), "truncated": len(rows) > MAX_FINDINGS,
             "findings": [{"finding_id": f["finding_id"], "region": f["region"], "error_code": f["error_code"],
                           "reason": f["reason"], "brand": f["brand"], "sku_count": len(f["skus"]),
-                          "sample_skus": f["skus"][:SAMPLE], "root_cause": f["root_cause"], "owner": f["owner"],
+                          "sample_skus": f["skus"][:SAMPLE], "root_cause": f["root_cause"], "owning_team": f["owner"],
                           "ticket": f["ticket"], "confirmed_by": f["confirmed_by"],
                           "created_at": f["created_at"].isoformat(timespec="seconds")} for f in rows[:MAX_FINDINGS]],
+            "fields": FINDING_FIELDS,
             "note": "Confirmed by a person, not by a tool. Verify with diagnose_batch before relying on one."}
 
 
@@ -367,8 +376,9 @@ def _finish(name: str, result: dict, ctx: ToolContext, hit: bool) -> dict:
             if closed:
                 result["findings_resolved"] = closed
         if ctx.state is not None:
-            scope = ctx.state.scope_id(result["week"], private["skus"], result["regions"])
-            changes = ctx.state.record_check(scope, result["as_of"], result["data_version"], private["failing"])
+            scope = ctx.state.scope_id(result["week"], private["skus"])
+            changes = ctx.state.record_check(scope, result["as_of"], result["data_version"], result["regions"],
+                                             private["failing"])
             if changes:
                 result["changes_since_last_check"] = changes
     return result

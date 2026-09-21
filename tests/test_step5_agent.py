@@ -105,7 +105,8 @@ def test_system_prompt_tells_the_model_to_report_everything_and_not_to_invent():
     prompt = system_prompt(WEEK)
     for rule in ("mention every pattern", "region by region", "contradict the user's premise", "not a shelf price",
                  "no tool gives promotion dates", "Never judge", "do not add numbers up", "Start with the finding",
-                 "do not name teams or owners"):
+                 "do not name teams or owners", "Open findings for this week appear",
+                 "puts those sentences at the top", "not the owning team"):
         assert rule in prompt
 
 

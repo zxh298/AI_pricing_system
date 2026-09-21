@@ -27,7 +27,7 @@ from pydantic import BaseModel, Field
 
 from services.diagnostic_api.agent import run_turn
 from services.diagnostic_api.cache import ToolCache
-from services.diagnostic_api.findings import FindingsStore
+from services.diagnostic_api.findings import FindingsStore, render_block
 from services.diagnostic_api.llm import get_llm
 from services.diagnostic_api.runs import RunResolver
 from services.diagnostic_api.sessions import SessionError, SessionStore
@@ -127,11 +127,13 @@ def create_app(store: SessionStore | None = None, llm_factory=get_llm, ctx_facto
             state = SessionState(s["state"])
             history, dropped = compact_history(s["history"])                 # older turns: question + answer only
             state.note_dropped(dropped)
-            base = ctx_factory(user, regions_for(user, cfg.user_regions))
+            allowed = regions_for(user, cfg.user_regions)
+            base = ctx_factory(user, allowed)
+            known = findings.list(week=s["week"], status="open", allowed_regions=allowed)   # shown to the model by us
             ctx = dataclasses.replace(base, state=state, runs=runs, cache=cache, findings=findings)   # a copy for this turn
             try:
                 out = run_turn(body.text, ctx, llm_factory(s["week"]), s["week"], history=history,
-                               state_block=state.render())
+                               state_block="\n\n".join(b for b in (state.render(), render_block(known)) if b))
             except Exception:                                                # noqa: BLE001 - nothing was saved
                 log.exception("turn failed in session %s", session_id)
                 raise HTTPException(502, "the assistant is unavailable; nothing was saved") from None

@@ -6,8 +6,9 @@ State (stored as JSON on the session):
                       Tools take `group_id` instead of long SKU lists. A group says WHICH products, never what
                       their status is: status is always re-queried.
     earlier_questions questions from turns that have been dropped from the history (answers are gone)
-    last_checks       for each checked scope (week, skus, regions) the failing records of its last diagnosis, so a
-                      repeated question is answered with what changed since then (computed here, not by the model)
+    last_checks       for each checked SKU list (week + skus) the regions and failing records of its last diagnosis,
+                      so a repeated question is answered with what changed since then, in the regions both checks
+                      covered (computed here, not by the model)
 
 History compaction keeps the conversation the model sees small and stable. It runs when a new question
 arrives, on the turns stored so far:
@@ -43,22 +44,34 @@ class SessionState:
                 "earlier_questions": self.earlier_questions, "last_checks": self.last_checks}
 
     @staticmethod
-    def scope_id(week: str, skus: list[str], regions: list[str]) -> str:
-        """Identifies what a check looked at: the same week, SKUs and regions, however they were listed."""
-        raw = json.dumps([week, sorted(set(skus)), sorted(set(regions))])
+    def scope_id(week: str, skus: list[str]) -> str:
+        """Identifies what a check was about: the week and the SKU list, however it was listed. Regions are not part
+        of it: the model may name them differently from one call to the next, so a diff compares the regions two
+        checks have in common instead."""
+        raw = json.dumps([week, sorted(set(skus))])
         return hashlib.sha1(raw.encode()).hexdigest()[:16]
 
-    def record_check(self, scope_id: str, as_of: str, data_version: str | None, failing: dict[str, str]) -> dict | None:
-        """Remember this diagnosis and return what changed since the previous one for the same scope
-        (None the first time). `failing` maps 'sku|pack|region' to 'CODE:reason' for every failing record."""
+    def record_check(self, scope_id: str, as_of: str, data_version: str | None, regions: list[str],
+                     failing: dict[str, str]) -> dict | None:
+        """Remember this diagnosis and return what changed since the previous one of the same SKUs, in the regions
+        both covered (None the first time, or when they share no region). `failing` maps 'sku|pack|region' to
+        'CODE:reason' for every failing record."""
         previous = self.last_checks.get(scope_id)
-        self.last_checks[scope_id] = {"as_of": as_of, "data_version": data_version, "failing": failing}
+        self.last_checks[scope_id] = {"as_of": as_of, "data_version": data_version, "regions": sorted(regions),
+                                      "failing": failing}
         while len(self.last_checks) > MAX_CHECKS:                  # forget the oldest scope
             del self.last_checks[min(self.last_checks, key=lambda k: self.last_checks[k]["as_of"])]
-        if previous is None:
+        common = set(regions) & set((previous or {}).get("regions") or [])
+        if not common:
             return None
-        return {"previous_as_of": previous["as_of"], "previous_data_version": previous["data_version"],
-                **diff_checks(previous["failing"], failing)}
+        in_common = lambda failures: {k: v for k, v in failures.items() if k.split("|")[2] in common}      # noqa: E731
+        diff = diff_checks(in_common(previous["failing"]), in_common(failing))
+        headline = (f"Since the last check ({previous['as_of']}), in {'/'.join(sorted(common))}: {diff['resolved']} resolved, "
+                    f"{diff['new_failures']} new, {diff['changed']} changed, {diff['still_failing']} still failing.")
+        if not (diff["resolved"] or diff["new_failures"] or diff["changed"]):
+            headline += " Nothing has changed."
+        return {"headline": headline, "regions_compared": sorted(common), "previous_as_of": previous["as_of"],
+                "previous_data_version": previous["data_version"], **diff}
 
     def set_scope(self, **scope) -> None:
         self.scope = {k: v for k, v in scope.items() if v}

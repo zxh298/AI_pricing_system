@@ -20,7 +20,7 @@ from jobs.data_gen.generate import WEEK
 from services.diagnostic_api import tools
 from services.diagnostic_api.app import create_app
 from services.diagnostic_api.cache import ToolCache
-from services.diagnostic_api.findings import FindingsStore
+from services.diagnostic_api.findings import FindingsStore, render_block
 from services.diagnostic_api.llm import ScriptedLLM, text, tool_use
 from services.diagnostic_api.sessions import SessionStore
 from services.diagnostic_api.state import MAX_CHECKS, SAMPLE, SessionState, diff_checks
@@ -37,6 +37,7 @@ pg = pytest.mark.skipif(not HAVE_PG, reason="Postgres not reachable (docker comp
 ALICE = {"X-User": "alice"}
 ANALYST = {"X-User": "ana", "X-Role": "analyst"}
 PROMO = "NOT_EFFECTIVE:PROMOTION"
+BLOCK = "Open findings for this week (each was confirmed by a person"       # the block's header, not the prompt's rule
 
 
 # ======================= diffs between two diagnoses (pure) =======================
@@ -60,18 +61,35 @@ def test_diff_examples_are_capped_but_counts_are_not():
 
 def test_the_first_check_of_a_scope_has_no_diff_and_the_second_does():
     st = SessionState()
-    scope = st.scope_id(WEEK, ["2", "1"], ["VIC", "NSW"])
-    assert scope == st.scope_id(WEEK, ["1", "2", "2"], ["NSW", "VIC"])            # order and repeats do not matter
-    assert scope != st.scope_id(WEEK, ["1", "2"], ["NSW"]) and scope != st.scope_id("2026-W40", ["1", "2"], ["NSW", "VIC"])
-    assert st.record_check(scope, "t1", "v1", {"1|1|VIC": PROMO}) is None
-    d = st.record_check(scope, "t2", "v2", {})
+    scope = st.scope_id(WEEK, ["2", "1"])
+    assert scope == st.scope_id(WEEK, ["1", "2", "2"])                             # order and repeats do not matter
+    assert scope != st.scope_id(WEEK, ["1"]) and scope != st.scope_id("2026-W40", ["1", "2"])
+    assert st.record_check(scope, "t1", "v1", ["VIC"], {"1|1|VIC": PROMO}) is None
+    d = st.record_check(scope, "t2", "v2", ["VIC"], {})
     assert d["previous_as_of"] == "t1" and d["previous_data_version"] == "v1" and d["resolved"] == 1
+    assert d["headline"] == "Since the last check (t1), in VIC: 1 resolved, 0 new, 0 changed, 0 still failing."
+    quiet = st.record_check(scope, "t3", "v3", ["VIC"], {})
+    assert quiet["headline"] == ("Since the last check (t2), in VIC: 0 resolved, 0 new, 0 changed, 0 still failing. "
+                                 "Nothing has changed.")
+    mixed = st.record_check(scope, "t4", "v4", ["VIC"], {"9|1|VIC": PROMO})
+    assert "1 new" in mixed["headline"] and "Nothing has changed" not in mixed["headline"]
+
+
+def test_a_diff_compares_only_the_regions_both_checks_covered():
+    st, scope = SessionState(), SessionState.scope_id(WEEK, ["1", "2"])
+    st.record_check(scope, "t1", "v1", ["NSW", "VIC"], {"1|1|VIC": PROMO, "2|1|NSW": "MISSING_PRICE:MISSING_RULE"})
+    # the model now names other regions: QLD is new, NSW is gone, VIC is common. Only VIC is compared
+    d = st.record_check(scope, "t2", "v2", ["QLD", "VIC"], {"1|1|VIC": PROMO, "3|1|QLD": PROMO})
+    assert d["regions_compared"] == ["VIC"] and (d["resolved"], d["new_failures"], d["still_failing"]) == (0, 0, 1)
+    assert d["headline"].startswith("Since the last check (t1), in VIC:")
+    assert st.record_check(scope, "t3", "v3", ["NSW"], {}) is None                 # no region in common with the last check
+    assert st.record_check(scope, "t4", "v4", ["NSW"], {})["regions_compared"] == ["NSW"]   # and it is compared from then on
 
 
 def test_only_the_most_recent_scopes_are_remembered_and_they_survive_json():
     st = SessionState()
     for i in range(MAX_CHECKS + 2):
-        st.record_check(f"scope{i}", f"2026-09-21T09:0{i}:00", None, {})
+        st.record_check(f"scope{i}", f"2026-09-21T09:0{i}:00", None, ["VIC"], {})
     assert sorted(st.last_checks) == [f"scope{i}" for i in range(2, MAX_CHECKS + 2)]
     again = SessionState(json.loads(json.dumps(st.to_json())))
     assert again.last_checks == st.last_checks
@@ -117,7 +135,7 @@ def rig(env, monkeypatch):
     SessionStore().ensure_schema()
     clock = [datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc)]
     now = lambda: clock[0]                                                        # noqa: E731
-    r = SimpleNamespace(env=env, clock=clock, box=live_sap(env), runs=Runs(), monkeypatch=monkeypatch, steps=[],
+    r = SimpleNamespace(env=env, clock=clock, box=live_sap(env), runs=Runs(), monkeypatch=monkeypatch, steps=[], llms=[],
                         cache=ToolCache(clock=now), findings=FindingsStore(clock=now), now=now)
 
     def mk(user="alice", allowed=None, state=True):
@@ -271,18 +289,29 @@ def test_a_repeated_diagnosis_says_what_changed_since_the_last_one(rig):
     second = call(ctx, "diagnose_batch", week=WEEK, group_id=group["group_id"])
     changes = second["changes_since_last_check"]
     assert changes["previous_as_of"] == first["as_of"] and changes["resolved"] == n and changes["new_failures"] == 0
+    assert changes["headline"].startswith(f"Since the last check ({first['as_of']}), in NSW/QLD/VIC: {n} resolved, 0 new, 0 changed,")
     assert changes["still_failing"] == sum(p["count"] for p in first["patterns"]) - n
     assert {e["was"] for e in changes["examples"]["resolved"]} == {PROMO}
     assert "NOT_EFFECTIVE" not in second["totals"]
     third = call(ctx, "diagnose_batch", week=WEEK, group_id=group["group_id"])           # asked again straight away
     assert third["cached"] is True and third["changes_since_last_check"]["resolved"] == 0   # nothing changed since
+    assert third["changes_since_last_check"]["headline"].endswith("Nothing has changed.")
 
 
 @pg
-def test_a_different_scope_gets_no_diff_and_no_session_means_no_diff(rig):
+def test_the_diff_survives_the_model_naming_regions_differently_but_not_other_skus(rig):
     ctx = rig.mk()
-    call(ctx, "diagnose_batch", week=WEEK, skus=rig.env["skus"])
-    assert "changes_since_last_check" not in call(ctx, "diagnose_batch", week=WEEK, skus=rig.env["skus"], regions=["VIC"])
+    call(ctx, "diagnose_batch", week=WEEK, skus=rig.env["skus"], regions=["NSW", "VIC"])
+    again = call(ctx, "diagnose_batch", week=WEEK, skus=rig.env["skus"])                           # all regions this time
+    assert again["changes_since_last_check"]["regions_compared"] == ["NSW", "VIC"]
+    assert again["changes_since_last_check"]["resolved"] == 0 and again["changes_since_last_check"]["still_failing"] > 0
+    only_vic = call(ctx, "diagnose_batch", week=WEEK, skus=rig.env["skus"], regions=["VIC"])
+    assert only_vic["changes_since_last_check"]["regions_compared"] == ["VIC"]
+    assert "changes_since_last_check" not in call(ctx, "diagnose_batch", week=WEEK, skus=rig.env["skus"][:5])   # other skus
+
+
+@pg
+def test_no_session_means_no_diff(rig):
     bare = rig.mk(state=False)
     call(bare, "diagnose_batch", week=WEEK, skus=rig.env["skus"])
     assert "changes_since_last_check" not in call(bare, "diagnose_batch", week=WEEK, skus=rig.env["skus"])
@@ -339,7 +368,10 @@ def test_get_findings_shows_open_issues_the_user_may_see(rig):
     got = call(rig.mk(), "get_findings", week=WEEK)
     assert got["count"] == 2 and "not by a tool" in got["note"]
     one = next(f for f in got["findings"] if f["finding_id"] == a["finding_id"])
-    assert one["owner"] == "Promotions" and one["ticket"] == "PRC-1" and one["confirmed_by"] == "ana"
+    assert one["owning_team"] == "Promotions" and one["ticket"] == "PRC-1" and one["confirmed_by"] == "ana"
+    assert "owner" not in one                                                                          # no bare "owner" to misread
+    assert set(got["fields"]) == {"owning_team", "confirmed_by", "ticket"}
+    assert "not the owning team" in got["fields"]["confirmed_by"]
     assert one["root_cause"].startswith("VIC-only") and one["sku_count"] == len(promo_skus(rig.env))
     big = next(f for f in got["findings"] if f["finding_id"] == b["finding_id"])
     assert big["sku_count"] == 9 and len(big["sample_skus"]) == SAMPLE                                 # short, not the whole list
@@ -387,7 +419,11 @@ def test_diagnosing_closes_findings_whose_failures_are_gone(rig):
 @pytest.fixture
 def client(rig):
     from fastapi.testclient import TestClient
-    app = create_app(SessionStore(clock=rig.now), lambda week: ScriptedLLM(rig.steps),
+    def llm_factory(week):
+        llm = ScriptedLLM(rig.steps)
+        rig.llms.append(llm)
+        return llm
+    app = create_app(SessionStore(clock=rig.now), llm_factory,
                      lambda user, regions: rig.mk(user, regions, state=False), rig.runs, rig.cache, rig.findings)
     with TestClient(app) as c:
         yield c
@@ -453,6 +489,35 @@ def test_a_turn_cannot_create_or_close_findings(rig, client):
     assert [f["finding_id"] for f in client.get("/findings", headers=ALICE).json()] == [fid]           # untouched
 
 
+@pg
+def test_code_written_sentences_lead_the_answer_and_the_history_keeps_the_models_text(rig, client):
+    sid = client.post("/sessions", headers=ALICE).json()["session_id"]
+
+    def ask(*steps):
+        rig.steps = list(steps)
+        r = client.post(f"/sessions/{sid}/messages", json={"text": "how are they?"}, headers=ALICE)
+        assert r.status_code == 200, r.text
+        return r.json()
+
+    def db_one(sql):
+        with db.connect() as c:
+            return c.execute(sql, (sid,)).fetchone()
+
+    first = ask([tool_use("resolve_products", {"week": WEEK})], [tool_use("diagnose_batch", {"week": WEEK, "group_id": "G1"})],
+                [text("First look.")])
+    assert first["answer"] == "First look."                                                 # nothing to compare with yet
+    second = ask([tool_use("diagnose_batch", {"week": WEEK, "group_id": "G1"})], [text("Same as before.")])
+    head, _, rest = second["answer"].partition("\n\n")
+    assert head.startswith("Since the last check (") and head.endswith("still failing. Nothing has changed.")
+    assert rest == "Same as before."                                                        # the model's words follow
+    turn2 = db_one("SELECT answer FROM diagnostic_test.turn_transcripts WHERE session_id = %s AND turn_no = 2")
+    assert turn2["answer"] == second["answer"]                                              # the audit log has what the user saw
+    history = db_one("SELECT history FROM diagnostic_test.sessions WHERE session_id = %s")["history"]
+    assert history[-1]["content"] == [text("Same as before.")]                             # the model's context stays its own text
+    failed = ask([tool_use("diagnose_batch", {"week": WEEK, "group_id": "G9"})], [text("Cannot.")])
+    assert failed["answer"] == "Cannot." and failed["tool_calls"][0]["is_error"]            # a failed call adds no sentence
+
+
 # ======================= the section 3.3 investigation, end to end =======================
 def tool_results(sid, turn):
     with db.connect() as c:
@@ -476,6 +541,7 @@ def test_the_section_3_3_investigation_end_to_end(rig, client):
         return r.json()
 
     # 1. nothing is known yet, so the assistant investigates: brand -> skus -> verdicts
+    assert not rig.llms                                                                                # nothing asked yet
     t1 = ask("VIC prices did not drop, NSW is fine. Why?",
              [tool_use("get_findings", {"week": WEEK})], [tool_use("resolve_products", {"week": WEEK, "brand": brand})],
              [tool_use("diagnose_batch", {"week": WEEK, "group_id": "G1"})], [text("A VIC promotion overrides the markdown.")])
@@ -484,6 +550,7 @@ def test_the_section_3_3_investigation_end_to_end(rig, client):
     vic = next(p for p in diagnosis["patterns"] if p["code"] == "NOT_EFFECTIVE")
     assert vic["region"] == "VIC" and vic["reason"] == "PROMOTION" and "changes_since_last_check" not in diagnosis
     assert t1["answer"] == "A VIC promotion overrides the markdown."
+    assert BLOCK not in rig.llms[0].calls[0]["system"]                                                 # none recorded yet
 
     # 2. a person confirms the cause; the model cannot do this
     made = client.post("/findings", json=body(rig, skus=vic["sample_skus"], brand=brand, owner="Promotions team",
@@ -493,8 +560,10 @@ def test_the_section_3_3_investigation_end_to_end(rig, client):
 
     # 3. the next question finds the known issue first
     ask("Is this a known issue?", [tool_use("get_findings", {"week": WEEK, "region": "VIC"})], [text("Yes, PRC-42.")])
+    prompt = rig.llms[-1].calls[0]["system"]
+    assert BLOCK in prompt and "PRC-42" in prompt and "owning team Promotions team" in prompt
     known = tool_results(sid, 2)[0]["findings"][0]
-    assert (known["finding_id"], known["owner"], known["ticket"]) == (fid, "Promotions team", "PRC-42")
+    assert (known["finding_id"], known["owning_team"], known["ticket"]) == (fid, "Promotions team", "PRC-42")
 
     # 4. "if we end the promotion, would they go below the floor?" is answered by the rules, not the model
     ask("If we end the promotion, would they go below the floor?",
@@ -505,11 +574,69 @@ def test_the_section_3_3_investigation_end_to_end(rig, client):
     # 5. the promotion ends; asking again reports what changed and closes the finding
     rig.box.end_promotions()
     rig.clock[0] += timedelta(minutes=6)
-    ask("Check again.", [tool_use("diagnose_batch", {"week": WEEK, "group_id": "G1"})], [text("Fixed.")])
+    t4 = ask("Check again.", [tool_use("diagnose_batch", {"week": WEEK, "group_id": "G1"})], [text("Fixed.")])
     again = tool_results(sid, 4)[0]
+    assert t4["answer"] == (again["changes_since_last_check"]["headline"] + "\n"
+                            f"Findings closed automatically because their problem is gone: #{fid}.\n\nFixed.")   # code first, then the model
     assert again["changes_since_last_check"]["resolved"] == vic["count"]
     assert again["changes_since_last_check"]["new_failures"] == 0 and "NOT_EFFECTIVE" not in again["totals"]
     assert again["findings_resolved"] == [fid]
     assert client.get("/findings", headers=ALICE).json() == []
     closed = client.get("/findings?status=all", headers=ALICE).json()[0]
     assert closed["status"] == "resolved" and closed["resolved_by"] == "auto"
+
+
+# ======================= open findings are put in front of the model by the service =======================
+def fake_row(i=1, **over):
+    return {"finding_id": i, "region": "VIC", "error_code": "NOT_EFFECTIVE", "reason": "PROMOTION", "brand": "Larkspur",
+            "skus": ["1", "2", "3", "4", "5"], "root_cause": "a VIC promotion overrides the markdown", "owner": "Promotions team",
+            "ticket": "PRC-42", "confirmed_by": "ana"} | over
+
+
+def test_findings_render_as_a_short_block():
+    assert render_block([]) == ""
+    block = render_block([fake_row()])
+    assert block.splitlines()[0].startswith("Open findings for this week (each was confirmed by a person; verify")
+    assert ("- #1 VIC NOT_EFFECTIVE:PROMOTION, 5 skus (1, 2, 3 and 2 more), brand Larkspur: a VIC promotion overrides the "
+            "markdown [owning team Promotions team, ticket PRC-42] [confirmed by ana]") in block
+
+
+def test_findings_block_copes_with_missing_fields_long_text_and_many_findings():
+    bare = render_block([fake_row(reason="", brand=None, owner=None, ticket=None, skus=["9"], root_cause="x" * 300)])
+    line = bare.splitlines()[1]
+    assert line.startswith("- #1 VIC NOT_EFFECTIVE, 1 skus (9): xxx") and line.count("x") == 197 and "..." in line
+    assert "owning team" not in line and "ticket" not in line and line.endswith("[confirmed by ana]")
+    many = render_block([fake_row(i) for i in range(1, 9)])
+    lines = many.splitlines()                                                                          # header + 5 items + a note
+    assert len(lines) == 1 + 5 + 1 and lines[-1] == "- ... and 3 more; call get_findings to see them"
+
+
+@pg
+def test_open_findings_reach_the_model_without_it_asking(rig, client):
+    open_one = client.post("/findings", json=body(rig, ticket="PRC-7"), headers=ANALYST).json()
+    closed = client.post("/findings", json=body(rig, ticket="PRC-8", error_code="MISSING_PRICE"), headers=ANALYST).json()
+    client.post(f"/findings/{closed['finding_id']}/resolve", headers=ANALYST)
+    client.post("/findings", json=body(rig, week="2026-W38", ticket="PRC-OLD"), headers=ANALYST)      # another week
+    sid = client.post("/sessions", headers=ALICE).json()["session_id"]
+    rig.steps = [[text("ok")]]
+    client.post(f"/sessions/{sid}/messages", json={"text": "hi"}, headers=ALICE)
+    prompt = rig.llms[-1].calls[0]["system"]
+    assert BLOCK in prompt and f"#{open_one['finding_id']}" in prompt and "PRC-7" in prompt
+    assert "PRC-8" not in prompt and "PRC-OLD" not in prompt                                          # resolved / other week: hidden
+
+
+@pg
+def test_the_findings_in_the_prompt_respect_the_users_regions(rig, client):
+    client.post("/findings", json=body(rig, region="VIC", ticket="PRC-VIC"), headers=ANALYST)
+    client.post("/findings", json=body(rig, region="NSW", error_code="MISSING_PRICE", reason="MISSING_RULE", ticket="PRC-NSW"),
+                headers=ANALYST)
+    rig.monkeypatch.setenv("USER_REGIONS", '{"nsw-analyst": ["NSW"]}')
+    nsw = {"X-User": "nsw-analyst"}
+    sid = client.post("/sessions", headers=nsw).json()["session_id"]
+    rig.steps = [[text("ok")]]
+    client.post(f"/sessions/{sid}/messages", json={"text": "hi"}, headers=nsw)
+    prompt = rig.llms[-1].calls[0]["system"]
+    assert "PRC-NSW" in prompt and "PRC-VIC" not in prompt                                            # VIC is not theirs to see
+    sid = client.post("/sessions", headers=ALICE).json()["session_id"]
+    client.post(f"/sessions/{sid}/messages", json={"text": "hi"}, headers=ALICE)
+    assert "PRC-NSW" in rig.llms[-1].calls[0]["system"] and "PRC-VIC" in rig.llms[-1].calls[0]["system"]

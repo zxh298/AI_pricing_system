@@ -130,8 +130,9 @@ Errors grouped by the stage where they occur. Each should get an **error code, s
 7. **Pipeline operations:** DAG failure or SLA miss before the weekly cutoff; duplicate run
    or wrong `run_id` / week.
 
-Codes used in code so far: `NOT_IN_LIST`, `MISSING_PRICE`, `RULE_VIOLATION`,
-`API_REJECTED`, `NOT_EFFECTIVE`, `OK` (plus `PROMO_OVERLAP` as a pre-send rule).
+Codes used in code (see section 17.2): `NOT_IN_LIST`, `MISSING_PRICE`, `RULE_VIOLATION`,
+`API_REJECTED`, `NOT_EFFECTIVE`, `PRICE_MISMATCH`, `MISSING_IN_SAP`, `OK`. `PROMO_OVERLAP` as a
+pre-send rule is still planned (section 3.3 step 9), not built.
 
 ---
 
@@ -355,7 +356,15 @@ AUTH_MODE=none | iam        # attach ID tokens for service-to-service calls
 LLM_PROVIDER=scripted | anthropic
 ANTHROPIC_API_KEY=...       # .env locally (gitignored), Secret Manager on GCP
 SAP_READ_KEY=... / SAP_WRITE_KEY=...
+ANTHROPIC_MODEL=claude-haiku-4-5   # claude-sonnet-5 for more reliable multi-step demos
+DEFAULT_WEEK=2026-W39       # what "this week" means (default: today's ISO week)
+SESSION_IDLE_MINUTES=120    # diagnostic-api session idle timeout
+USER_REGIONS={"nsw-analyst": ["NSW"]}   # local stand-in for IAP permissions; unlisted users see all
+TOOL_CACHE_TTL_SECONDS=300  # reuse of live (SAP) tool results
+DIAGNOSTIC_SCHEMA=diagnostic            # Postgres schema for sessions, transcripts, cache, findings
+SAP_SCHEMA=sap / PIPELINE_SCHEMA=pipeline
 ```
+Local runs read `.env` (the server and chat CLI load it themselves; real environment variables win).
 
 ---
 
@@ -394,6 +403,8 @@ Each service/job has its own Dockerfile and requirements; build context is the r
 
 ## 9. Build order (each step must run end to end before moving on)
 
+**Status: steps 1-5 done and tested; steps 6-9 not started.** Step 5 as built: section 17.
+
 1. **Synthetic data** → DuckDB: SKUs (fictional brands), stores/regions, sales, inventory,
    weekly candidate list, business rules. Seeded so scenarios are reproducible.
 2. **Pricing engine:** simple price-elasticity model (e.g. log-log regression) + rule engine
@@ -402,8 +413,8 @@ Each service/job has its own Dockerfile and requirements; build context is the r
    reconciliation. Inject scenarios: promotion overlap, 422 validity overlap, 429/5xx,
    missing article, missing price.
 4. **weekly-pipeline job** chaining 1–3.
-5. **diagnostic-api:** port the reference implementation (section 14) to DuckDB / Postgres /
-   mock-sap; session, memory, cache, findings.
+5. **diagnostic-api:** DONE (rebuilt from sections 3-5, not ported: the reference files in
+   section 14 were never in the repo). Session, memory, cache, findings: section 17.
 6. **rag-ingest + playbooks** into pgvector; implement `search_docs`.
 7. **ui:** Streamlit chat; expandable panel showing tool calls per answer.
 8. **infra:** IAM script and deploy script for GCP.
@@ -460,7 +471,8 @@ Each service/job has its own Dockerfile and requirements; build context is the r
 
 ## 14. Reference implementation (already written)
 
-Two Python files produced during design; port them into `services/diagnostic_api/`:
+**Note: these two files are not in the repo. Step 5 was rebuilt from sections 3-5 instead (section 17).**
+Two Python files produced during design, kept here as history of the intended design:
 
 - `pricing_diagnostic_assistant.py`: mock data, deterministic core (`diagnose`,
   `check_rules_one`), tools (`resolve_products`, `diagnose_batch`, `get_sap_conditions`,
@@ -502,8 +514,139 @@ dicts → DuckDB / mock-sap queries, real brand placeholders → fictional brand
   will be source-available. Options: **PolyForm Noncommercial 1.0.0** (learning and
   non-commercial use allowed) or **no licence** (all rights reserved, view-only portfolio).
   CC BY-NC 4.0 only for docs, not code.
-- LLM for demos: Anthropic API vs local Ollama.
-- Whether to add Airflow locally or keep the pipeline as a plain job.
+- ~~LLM for demos~~ **Decided:** Anthropic API, `claude-haiku-4-5` for development
+  (`claude-sonnet-5` optional for demos). Provider interface keeps `scripted` for offline use.
+- ~~Airflow locally~~ **Decided: no.** Too heavy for six sequential steps; Composer is ruled out on cost
+  (section 13), so the deployed shape is a Cloud Run Job + Scheduler. The pipeline is a plain job
+  with per-step state in Postgres, idempotent reruns and a validation gate. An optional DAG wrapper
+  could be added at the end.
+- Open for step 6: embedding model (local sentence-transformers / Ollama vs an API).
+- Open: cleanup of expired sessions (none yet); a "bypass the cache" option for urgent checks.
+
+---
+
+## 17. As built: step 5, the diagnostic-api
+
+Status: steps 1-5 done, 207 tests. Nothing here needs BigQuery, Redis or any always-on paid resource.
+
+### 17.1 Modules (`services/diagnostic_api/`)
+
+| Module | Role |
+|---|---|
+| `core.py` | deterministic verdict per (sku, pack_qty, region); reuses the pipeline's pure `validate_rows` and `reconcile` |
+| `tools.py` | the tools, schemas, allow-listed `execute_tool`, and the cache / diff / auto-close wrapper |
+| `agent.py` | the LLM tool-use loop (`run_turn`), system prompt, step limit with escalation |
+| `llm.py` | providers: `scripted` (offline, incl. the canonical demo) and `anthropic` |
+| `state.py` | session state (groups, scope, last checks), history compaction, diffs |
+| `runs.py` | newest finished pipeline run for a week, and its `data_version` |
+| `cache.py` | shared tool-result cache in Postgres |
+| `findings.py` | person-confirmed issues; auto-close when the failure is gone; renders open findings for the prompt |
+| `sessions.py` | session store: ownership, expiry, per-session lock, optimistic locking, atomic save |
+| `app.py` | FastAPI: sessions, messages, findings. `chat.py` is a terminal client |
+
+Tools (all read-only): `resolve_products`, `diagnose_batch`, `get_sap_conditions`, `get_api_log`,
+`check_rules`, `get_findings`, `search_docs` (stub until step 6). Tools take `skus` or a `group_id`.
+The service never holds the SAP write key; mock-sap also gained a read-only `GET /pricing/submissions`.
+
+### 17.2 Verdict codes (precedence order)
+
+`NOT_IN_LIST` (not on this week's SAP list for that region) > `MISSING_PRICE` (engine skipped it, or
+priced but never sent; `reason` is the skip reason or `NOT_SENT`) > `RULE_VIOLATION` (a hard rule fails;
+`reason` lists the rules) > `API_REJECTED` (`reason` is SAP's code, e.g. `VALIDITY_OVERLAP`) >
+`NOT_EFFECTIVE` (SAP accepted but a promotion overrides; `reason` = `PROMOTION`) > `PRICE_MISMATCH` >
+`MISSING_IN_SAP` > `OK`.
+
+### 17.3 What the model receives on each call
+
+Rules (~700 tokens) + tool definitions (~1,100) + a short state block (~100, plus the week's open findings
+in the user's regions, written by the service so the model need not remember to ask) + earlier turns
+compacted to question + final answer + the current turn's tool traffic. Not sent: the cache, raw state JSON,
+old tool results, full SKU lists (handles instead), transcripts, other users' data. A model call
+inside a turn resends all of this (the API is stateless).
+
+### 17.4 Memory layers and where they live (Postgres schema `diagnostic`)
+
+| Layer | Table.column | Written by | Lifetime |
+|---|---|---|---|
+| Session state | `sessions.state` (JSONB) | tools/code, never the model | session |
+| Compacted history | `sessions.history` | the loop, after a successful turn | session |
+| Audit transcript | `turn_transcripts` (one row per turn, full tool traffic) | the loop, same transaction | kept after expiry (BigQuery on GCP) |
+| Findings | `findings` | people only (`POST /findings`, `X-Role: analyst`) | until resolved |
+| Tool cache | `tool_cache` | the tool wrapper | snapshot: until a new run (purged after 7 days); live: 5 min |
+
+State holds: scope, groups (`G1`.. handles, never reused, max 10), last checks (max 5 scopes, for
+diffs), earlier questions (max 30). Compaction runs when a question arrives: earlier turns shrink to
+question + answer, whole turns at a time so tool_use / tool_result stay paired; beyond 10 earlier turns
+the oldest survive only as a question in the state. Freshness rule kept from section 4.3: groups and
+history only say what the user refers to; status always comes from a tool call in the current turn.
+
+### 17.5 Cache
+
+Key = hash of (tool, week, normalised skus, regions, the user's permitted regions, run, `data_version`).
+Never the user's name or the question text. Users with the same access share entries; narrower access
+gets a different key, so it can never be served a wider result. `data_version` = run id + finish time
+of the newest finished run (SUCCEEDED / COMPLETED_WITH_ISSUES / BLOCKED) from `pipeline.pipeline_runs`;
+a rerun finishes again and becomes current. Snapshot tools (`check_rules`, `get_api_log`) follow
+`data_version`; live tools (`diagnose_batch`, `get_sap_conditions`) expire after 5 minutes.
+Not cached: `resolve_products` (creates the group handle), `get_findings`, errors, and anything without a
+`data_version`. A cache failure is treated as a miss. Session-specific parts (diff, closing findings)
+are applied after the shared result, never stored in it. Diff scope = week + SKU list; a diff compares the
+regions both checks covered, because the model may name regions differently from one call to the next.
+The diff carries a `headline` sentence; the service puts the headline (and "findings closed
+automatically") at the top of the answer itself, because small models did not reliably do it. Hits carry `cached: true` and the original `as_of`.
+
+### 17.6 Sessions, identity, permissions
+
+Identity: `X-User` header only (IAP stand-in), never body, query or model. Permissions: `USER_REGIONS`
+env map injected into the tools. Writing findings needs `X-Role: analyst` and the region must be
+permitted. Someone else's session is a 404, identical to an unknown id. Expiry: 120 min idle, and when
+the week rolls over (410). One turn at a time per session (Postgres advisory lock, 409), optimistic
+`version` check on save, state + history + audit written in one transaction only after the turn
+succeeded (a failed model call returns 502 and saves nothing).
+
+### 17.7 Findings
+
+A finding = week, region, error code, reason, SKUs, root cause, owner, ticket, confirmed_by (from
+`X-User`). The model sees open findings for the week in its prompt and via `get_findings` (both
+region-filtered), where `owner` is called `owning_team` and `confirmed_by` is explained as "the person who
+verified it, not the owning team" (a live run had conflated the two). It has no way to write them. After each `diagnose_batch`, deterministic code closes a finding only if the check covered its
+whole scope (region and all SKUs) and none of those records still fail with its code and reason.
+
+### 17.8 Deviations from sections 3-5
+
+- `data_version` comes from the pipeline run table, not "latest run in BigQuery".
+- Audit transcripts go to Postgres locally; BigQuery remains the GCP target.
+- Findings carry SKUs and a reason, so auto-close is decidable.
+- The service imports `validate_rows` and `reconcile` from `jobs/weekly_pipeline` (pure functions). The
+  future diagnostic image must copy those files (and `jobs/__init__.py`, `jobs/weekly_pipeline/__init__.py`).
+- Not built: cleanup of expired sessions, a cache bypass, the `PROMO_OVERLAP` pre-send rule.
+
+### 17.9 Lessons from running it with a real model (Haiku 4.5)
+
+- A model will misread an ambiguous field (`price`, `valid_from` became "list price" and "promotion
+  dates"). Fix: remove the data or rename it, add a `fields` note. Making a tool unable to mislead beats
+  asking the prompt nicely.
+- Prompt rules are followed unevenly by a small model (report every pattern, lead with the diff, check
+  findings first). Prefer moving the fact into code: per-region totals, the diff headline written by
+  code and put above the answer, findings placed in the prompt by the service. Two prompt-only attempts
+  at "start with the diff" failed live; the code version cannot.
+- Known remaining Haiku weaknesses: it sometimes leaves out an unrelated pattern (a SKU with no SAP
+  rule), calls a missing rule a "violation", and says promotions "take priority" although no tool gives
+  priorities. Options: `claude-sonnet-5`, or a code-side completeness check on the answer.
+- A diff keyed on arguments the model chooses (regions) silently disappears when it chooses differently;
+  key bookkeeping on what the user means (week + SKUs), not on tool arguments.
+- Counts and comparisons the model does itself go wrong ("13 of 13"); give it the totals.
+
+### 17.10 Commands
+
+```
+docker compose up -d postgres mock-sap
+.venv/bin/python -m pytest tests -q                                   # 200 tests; Postgres needed for some
+.venv/bin/python -m jobs.data_gen.scenarios --week 2026-W39 --apply promo overlap
+.venv/bin/python -m jobs.weekly_pipeline --week 2026-W39 --run-id 2026-W39-demo
+.venv/bin/python -m services.diagnostic_api.chat "question"           # terminal client (--run-id to pin a run)
+.venv/bin/uvicorn services.diagnostic_api.app:app --port 8000         # POST /sessions, /sessions/{id}/messages, /findings; see /docs
+```
 
 ---
 

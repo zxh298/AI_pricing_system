@@ -22,6 +22,27 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def render_block(rows: list[dict], max_items: int = 5) -> str:
+    """Open findings as a short block for the system prompt ('' when there are none), so the model sees known
+    issues without having to remember to ask. Newest first; at most `max_items`."""
+    if not rows:
+        return ""
+    lines = ["Open findings for this week (each was confirmed by a person; verify with diagnose_batch before relying "
+             "on one):"]
+    for f in rows[:max_items]:
+        skus = f["skus"]
+        shown = ", ".join(skus[:3]) + (f" and {len(skus) - 3} more" if len(skus) > 3 else "")
+        cause = f["root_cause"] if len(f["root_cause"]) <= 200 else f["root_cause"][:197] + "..."
+        who = ", ".join(x for x in ((f"owning team {f['owner']}" if f["owner"] else ""),
+                                    (f"ticket {f['ticket']}" if f["ticket"] else "")) if x)
+        lines.append(f"- #{f['finding_id']} {f['region']} {f['error_code']}" + (f":{f['reason']}" if f["reason"] else "")
+                     + f", {len(skus)} skus ({shown})" + (f", brand {f['brand']}" if f["brand"] else "")
+                     + f": {cause}" + (f" [{who}]" if who else "") + f" [confirmed by {f['confirmed_by']}]")
+    if len(rows) > max_items:
+        lines.append(f"- ... and {len(rows) - max_items} more; call get_findings to see them")
+    return "\n".join(lines)
+
+
 class FindingsStore:
     def __init__(self, database_url: str | None = None, clock: Callable[[], datetime] = _utcnow):
         self.url, self.s, self.clock = database_url, schema(), clock
