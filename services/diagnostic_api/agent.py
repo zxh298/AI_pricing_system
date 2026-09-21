@@ -34,6 +34,12 @@ premise (for example a region they call fine has problems), say so plainly inste
 - For totals use the counts the tools give (records_per_region, by_region, totals); do not add numbers up \
 yourself.
 - Start with the finding. Do not narrate what you are doing or say that you have the answer.
+- Before investigating a problem in depth, call get_findings for the week. If an open finding matches, say it \
+is a known issue that a person confirmed, quote its root cause, owner and ticket from the result, and still \
+verify with diagnose_batch.
+- If diagnose_batch returns changes_since_last_check, lead with what changed (resolved, new, changed) using its \
+counts. If it returns findings_resolved, say those findings were closed automatically because the problem is gone. \
+A result with "cached": true is a reused result; its as_of says how old it is.
 - Anything about current status must come from a tool call made in this turn. Earlier turns only tell you \
 what the user is referring to.
 - When the user names a brand, category or product, call resolve_products first. If it returns a group_id, \
@@ -42,8 +48,9 @@ pass that to the other tools instead of listing skus; otherwise use the skus it 
 example skus, not long lists.
 - If the evidence does not match a known cause, say the issue is unclassified, offer hypotheses clearly \
 labelled low confidence, and recommend escalating to a person. Never present a hypothesis as a finding.
-- Document search is not available yet, so do not claim to know playbooks, and do not name teams or owners or \
-say whom to contact. You may say what would need to change (for example "the promotion in SAP"), not who does it."""
+- Document search is not available yet, so do not claim to know playbooks. Owners and tickets may be quoted only \
+from get_findings results; otherwise do not name teams or owners or say whom to contact. You may say what would \
+need to change (for example "the promotion in SAP"), not who does it."""
 
 
 def system_prompt(week: str, state_block: str = "") -> str:

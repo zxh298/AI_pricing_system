@@ -24,6 +24,7 @@ class Config:
     default_week: str = ""                        # what "this week" means to the assistant
     session_idle_minutes: int = 120               # a session expires after this long without a message
     user_regions: str = ""                        # JSON {"user": ["REGION", ...]}; users not listed see every region
+    tool_cache_ttl_seconds: int = 300             # how long a live (SAP) tool result may be reused
 
 
 def load_config() -> Config:
@@ -42,4 +43,5 @@ def load_config() -> Config:
         default_week=e("DEFAULT_WEEK") or current_week(),
         session_idle_minutes=int(e("SESSION_IDLE_MINUTES", "120")),
         user_regions=e("USER_REGIONS", ""),
+        tool_cache_ttl_seconds=int(e("TOOL_CACHE_TTL_SECONDS", "300")),
     )

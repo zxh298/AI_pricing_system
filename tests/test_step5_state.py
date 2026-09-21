@@ -65,7 +65,8 @@ def test_state_survives_a_json_round_trip_and_key_order_loss():
     assert again.to_json() == st.to_json() and again.next_group == st.next_group
     assert again.add_group(["fresh"], "x", WEEK, ["VIC"], "t", None) == f"G{MAX_GROUPS + 2}"
     assert "G2" not in again.groups                                            # the oldest was dropped by number, not key order
-    assert SessionState(None).to_json() == {"scope": {}, "groups": {}, "next_group": 1, "earlier_questions": []}
+    assert SessionState(None).to_json() == {"scope": {}, "groups": {}, "next_group": 1, "earlier_questions": [],
+                                            "last_checks": {}}
 
 
 def test_scope_keeps_only_real_filters():

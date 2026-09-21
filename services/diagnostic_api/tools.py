@@ -6,9 +6,13 @@ Rules (docs/PROJECT_CONTEXT.md section 3.4):
   * User and permissions arrive in a ToolContext injected by the service, never in LLM arguments.
   * Batch tools collapse identical per-SKU results into patterns (count + a few sample skus).
   * Tools take `skus` or a `group_id` (a handle the session state holds); groups say which products, never
-    what their status is, so status is re-queried on every call.
+    what their status is, which always comes from a tool result.
   * Which pipeline run is diagnosed is decided by the service (pinned run, else the newest finished run for the
     week), never by the model.
+  * Results of diagnose_batch, get_sap_conditions, get_api_log and check_rules are cached per (tool, arguments,
+    permitted regions, data_version); see cache.py. A cache failure never fails a tool call.
+  * Around a diagnose_batch call the service (not the model) adds `changes_since_last_check` for a repeated scope
+    and closes findings whose failures are gone. The model has no tool that writes findings; get_findings only reads.
   * Dispatch is allow-listed; every call writes one audit log line; failures come back as
     is_error results for the LLM instead of raising.
   * SAP is only ever read (GET, read key); this module has no way to write a price.
@@ -26,7 +30,9 @@ from datetime import datetime, timezone
 import httpx
 
 from jobs.weekly_pipeline.validate import validate_rows
+from services.diagnostic_api.cache import ToolCache
 from services.diagnostic_api.core import diagnose
+from services.diagnostic_api.findings import FindingsStore
 from services.diagnostic_api.runs import RunResolver
 from services.diagnostic_api.state import SessionState
 from shared.config import load_config
@@ -37,6 +43,7 @@ audit = logging.getLogger("diagnostic.audit")
 MAX_SKUS = 500
 SAMPLE = 5
 MAX_ITEMS = 100
+MAX_FINDINGS = 20
 WEEK_RE = re.compile(r"^\d{4}-W\d{2}$")
 
 
@@ -62,6 +69,8 @@ class ToolContext:
     run_id: str | None = None                          # pins the pipeline run; the model cannot override it
     state: SessionState | None = None                  # the session's groups and scope (None: no session)
     runs: RunResolver | None = None                    # finds the newest finished run of a week
+    cache: ToolCache | None = None                     # shared tool-result cache (None: every call is computed)
+    findings: FindingsStore | None = None              # person-confirmed issues (None: none are kept)
 
 
 def make_context(user: str, allowed_regions=None, run_id: str | None = None) -> ToolContext:
@@ -188,12 +197,14 @@ def diagnose_batch(ctx: ToolContext, week: str, skus: list[str] | None = None, r
     recs = ctx.wh.get_recommendations(week, run)
     conditions = _sap_get(ctx, "/pricing/conditions", week=week)["items"]
     res = diagnose(skus, regions, cands, recs, ctx.wh.get_rules(week), conditions)
+    failing = {f"{x['sku']}|{x['pack_qty']}|{x['region']}": f"{x['code']}:{x['reason']}" for x in res if x["code"] != "OK"}
     return {"as_of": _as_of(), "week": week, "run_id": recs[0]["run_id"] if recs else None, "data_version": version,
             "skus_checked": len(skus), "regions": regions,
             "records_per_region": dict(Counter(x["region"] for x in res)),
             "totals": dict(Counter(x["code"] for x in res)),
             "by_region": {r: dict(Counter(x["code"] for x in res if x["region"] == r)) for r in regions},
-            "patterns": _patterns([x for x in res if x["code"] != "OK"], ["region", "code", "reason"])}
+            "patterns": _patterns([x for x in res if x["code"] != "OK"], ["region", "code", "reason"]),
+            "_private": {"skus": skus, "failing": failing}}       # for the session diff and findings; never sent on
 
 
 def get_sap_conditions(ctx: ToolContext, week: str, skus: list[str] | None = None, regions: list[str] | None = None,
@@ -249,6 +260,23 @@ def check_rules(ctx: ToolContext, week: str, skus: list[str] | None = None, regi
             "violations": len(found), "patterns": _patterns(found, ["region", "code"])}
 
 
+def get_findings(ctx: ToolContext, week: str, region: str | None = None, error_code: str | None = None,
+                 brand: str | None = None) -> dict:
+    """Open issues a person has confirmed (read-only). Check these before investigating from scratch."""
+    week = _week(week)
+    if ctx.findings is None:
+        return {"as_of": _as_of(), "week": week, "count": 0, "findings": [], "note": "no findings are kept in this session"}
+    rows = ctx.findings.list(week=week, status="open", region=region, error_code=error_code, brand=brand,
+                             allowed_regions=ctx.allowed_regions)
+    return {"as_of": _as_of(), "week": week, "count": len(rows), "truncated": len(rows) > MAX_FINDINGS,
+            "findings": [{"finding_id": f["finding_id"], "region": f["region"], "error_code": f["error_code"],
+                          "reason": f["reason"], "brand": f["brand"], "sku_count": len(f["skus"]),
+                          "sample_skus": f["skus"][:SAMPLE], "root_cause": f["root_cause"], "owner": f["owner"],
+                          "ticket": f["ticket"], "confirmed_by": f["confirmed_by"],
+                          "created_at": f["created_at"].isoformat(timespec="seconds")} for f in rows[:MAX_FINDINGS]],
+            "note": "Confirmed by a person, not by a tool. Verify with diagnose_batch before relying on one."}
+
+
 def search_docs(ctx: ToolContext, query: str) -> dict:
     """Playbook / incident search. Stub until the rag-ingest job exists (build step 6)."""
     return {"as_of": _as_of(), "results": [], "note": "document search is not available yet"}
@@ -256,7 +284,7 @@ def search_docs(ctx: ToolContext, query: str) -> dict:
 
 # ---------------- registry: allow-listed dispatch ----------------
 TOOLS = {f.__name__: f for f in (resolve_products, diagnose_batch, get_sap_conditions, get_api_log,
-                                 check_rules, search_docs)}
+                                 check_rules, get_findings, search_docs)}
 
 _WEEK = {"type": "string", "description": "ISO week id such as 2026-W39"}
 _SKUS = {"type": "array", "items": {"type": "string"}, "description": f"sku ids, at most {MAX_SKUS}"}
@@ -287,26 +315,95 @@ TOOL_SCHEMAS = [
     _schema("check_rules", "Re-check the hard price rules (floor, max markdown, ladder, max weeks) on the "
             "recommended prices. Use it for any 'would this break a rule' question.",
             {"week": _WEEK, "skus": _SKUS, "group_id": _GROUP, "regions": _REGIONS, "run_id": _RUN}, ["week"]),
+    _schema("get_findings", "Open issues a person has confirmed for a week (root cause, owner, ticket). Check them "
+            "before investigating a problem from scratch; a finding is not proof, so still verify with diagnose_batch.",
+            {"week": _WEEK, "region": {"type": "string"}, "error_code": {"type": "string"},
+             "brand": {"type": "string"}}, ["week"]),
     _schema("search_docs", "Search playbooks and incident notes for why something happens and who owns it.",
             {"query": {"type": "string"}}, ["query"]),
 ]
 
 
+# ---------------- cache, session diff, findings: around a tool call ----------------
+CACHE_KIND = {"check_rules": "snapshot", "get_api_log": "snapshot",          # derived from a pipeline run's outputs
+              "diagnose_batch": "live", "get_sap_conditions": "live"}       # read live SAP: short TTL only
+# resolve_products is not cached: it creates the session's group handle, which a cache hit would skip.
+
+
+def _cache_plan(name: str, args: dict, ctx: ToolContext) -> tuple[str, str | None, bool] | None:
+    """(cache key, data_version, live) for a cacheable call, else None. Never raises: any doubt means no caching,
+    and the tool itself then reports whatever is wrong with the arguments."""
+    kind = CACHE_KIND.get(name)
+    if kind is None or ctx.cache is None:
+        return None
+    try:
+        week = _week(args.get("week"))
+        skus, regions = args.get("skus"), args.get("regions")
+        if args.get("group_id") is not None:
+            group = ctx.state.get_group(args["group_id"]) if ctx.state else None
+            if group is None or group["week"] != week or skus is not None:
+                return None
+            skus, regions = group["skus"], regions if regions is not None else group["regions"]
+        run, version = _run(ctx, args.get("run_id"), week)
+        if kind == "snapshot" and version is None:
+            return None                                            # nothing says when a snapshot goes stale
+        parts = {"tool": name, "week": week, "skus": _skus(skus),
+                 "regions": None if regions is None else sorted(set(regions)),
+                 "allowed": None if ctx.allowed_regions is None else sorted(ctx.allowed_regions),
+                 "run": run, "version": version}
+        return ctx.cache.key(parts), version, kind == "live"
+    except Exception:                                              # noqa: BLE001
+        return None
+
+
+def _finish(name: str, result: dict, ctx: ToolContext, hit: bool) -> dict:
+    """Session-specific additions, applied after the (shared) result was computed or fetched."""
+    private = result.pop("_private", None)
+    if hit:
+        result["cached"] = True
+    if name == "diagnose_batch" and private:
+        if ctx.findings is not None:
+            closed = ctx.findings.auto_resolve(result["week"], result["regions"], private["skus"], private["failing"])
+            if closed:
+                result["findings_resolved"] = closed
+        if ctx.state is not None:
+            scope = ctx.state.scope_id(result["week"], private["skus"], result["regions"])
+            changes = ctx.state.record_check(scope, result["as_of"], result["data_version"], private["failing"])
+            if changes:
+                result["changes_since_last_check"] = changes
+    return result
+
+
 def execute_tool(name: str, args: dict | None, ctx: ToolContext) -> tuple[dict, bool]:
     """Run one allow-listed tool. Returns (result, is_error); never raises."""
     t0, args = time.perf_counter(), args or {}
-    is_error = False
+    is_error = hit = False
     try:
         fn = TOOLS.get(name)
         if fn is None:
             raise ToolError(f"unknown tool {name!r}")
         if "ctx" in args:
             raise ToolError("ctx is not a tool argument")
-        result = fn(ctx, **args)
+        plan = _cache_plan(name, args, ctx)
+        result = None
+        if plan:
+            try:
+                result = ctx.cache.get(plan[0])
+            except Exception:                                      # noqa: BLE001 - a broken cache is a miss
+                audit.warning("cache read failed for %s", name, exc_info=True)
+        hit = result is not None
+        if result is None:
+            result = fn(ctx, **args)
+            if plan:
+                try:
+                    ctx.cache.save(plan[0], name, plan[1], result, live=plan[2])
+                except Exception:                                  # noqa: BLE001
+                    audit.warning("cache write failed for %s", name, exc_info=True)
+        result = _finish(name, result, ctx, hit)
     except ToolError as e:
         result, is_error = {"error": str(e)}, True
     except Exception as e:                                          # noqa: BLE001 - reported to the LLM
         result, is_error = {"error": f"{type(e).__name__}: {e}"}, True
-    audit.info(json.dumps({"user": ctx.user, "tool": name, "args": args, "is_error": is_error,
+    audit.info(json.dumps({"user": ctx.user, "tool": name, "args": args, "is_error": is_error, "cached": hit,
                            "ms": round((time.perf_counter() - t0) * 1000)}, default=str))
     return result, is_error

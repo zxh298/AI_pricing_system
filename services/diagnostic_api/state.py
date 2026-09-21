@@ -6,6 +6,8 @@ State (stored as JSON on the session):
                       Tools take `group_id` instead of long SKU lists. A group says WHICH products, never what
                       their status is: status is always re-queried.
     earlier_questions questions from turns that have been dropped from the history (answers are gone)
+    last_checks       for each checked scope (week, skus, regions) the failing records of its last diagnosis, so a
+                      repeated question is answered with what changed since then (computed here, not by the model)
 
 History compaction keeps the conversation the model sees small and stable. It runs when a new question
 arrives, on the turns stored so far:
@@ -17,7 +19,12 @@ The full, uncompacted transcript of every turn is kept in the audit log (turn_tr
 """
 from __future__ import annotations
 
+import hashlib
+import json
+
 MAX_GROUPS = 10
+MAX_CHECKS = 5            # scopes whose last diagnosis is remembered
+SAMPLE = 5                # examples listed per kind of change
 MAX_TURNS = 10            # turns kept in the history (older ones as question + answer only)
 MAX_EARLIER = 30          # remembered questions from dropped turns
 
@@ -29,10 +36,29 @@ class SessionState:
         self.groups: dict[str, dict] = dict(d.get("groups") or {})
         self.next_group: int = int(d.get("next_group", 1))
         self.earlier_questions: list[str] = list(d.get("earlier_questions") or [])
+        self.last_checks: dict[str, dict] = dict(d.get("last_checks") or {})
 
     def to_json(self) -> dict:
         return {"scope": self.scope, "groups": self.groups, "next_group": self.next_group,
-                "earlier_questions": self.earlier_questions}
+                "earlier_questions": self.earlier_questions, "last_checks": self.last_checks}
+
+    @staticmethod
+    def scope_id(week: str, skus: list[str], regions: list[str]) -> str:
+        """Identifies what a check looked at: the same week, SKUs and regions, however they were listed."""
+        raw = json.dumps([week, sorted(set(skus)), sorted(set(regions))])
+        return hashlib.sha1(raw.encode()).hexdigest()[:16]
+
+    def record_check(self, scope_id: str, as_of: str, data_version: str | None, failing: dict[str, str]) -> dict | None:
+        """Remember this diagnosis and return what changed since the previous one for the same scope
+        (None the first time). `failing` maps 'sku|pack|region' to 'CODE:reason' for every failing record."""
+        previous = self.last_checks.get(scope_id)
+        self.last_checks[scope_id] = {"as_of": as_of, "data_version": data_version, "failing": failing}
+        while len(self.last_checks) > MAX_CHECKS:                  # forget the oldest scope
+            del self.last_checks[min(self.last_checks, key=lambda k: self.last_checks[k]["as_of"])]
+        if previous is None:
+            return None
+        return {"previous_as_of": previous["as_of"], "previous_data_version": previous["data_version"],
+                **diff_checks(previous["failing"], failing)}
 
     def set_scope(self, **scope) -> None:
         self.scope = {k: v for k, v in scope.items() if v}
@@ -77,6 +103,22 @@ class SessionState:
             lines.append("- earlier questions in this session (their answers are no longer available): "
                          + " | ".join(self.earlier_questions))
         return "\n".join(lines)
+
+
+def diff_checks(before: dict[str, str], now: dict[str, str]) -> dict:
+    """What changed between two diagnoses of the same scope, given their failing records."""
+    def item(key: str, **why) -> dict:
+        sku, pack, region = key.split("|")
+        return {"sku": sku, "pack_qty": None if pack == "None" else int(pack), "region": region, **why}
+
+    resolved = sorted(k for k in before if k not in now)
+    new = sorted(k for k in now if k not in before)
+    changed = sorted(k for k in before if k in now and before[k] != now[k])
+    return {"resolved": len(resolved), "new_failures": len(new), "changed": len(changed),
+            "still_failing": sum(1 for k in before if k in now and before[k] == now[k]),
+            "examples": {"resolved": [item(k, was=before[k]) for k in resolved[:SAMPLE]],
+                         "new_failures": [item(k, now=now[k]) for k in new[:SAMPLE]],
+                         "changed": [item(k, was=before[k], now=now[k]) for k in changed[:SAMPLE]]}}
 
 
 # ---------------- history compaction ----------------
