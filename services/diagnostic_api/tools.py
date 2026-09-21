@@ -34,6 +34,15 @@ MAX_ITEMS = 100
 WEEK_RE = re.compile(r"^\d{4}-W\d{2}$")
 
 
+# Shown to the model with get_sap_conditions results, so it cannot misread a field.
+CONDITION_FIELDS = {
+    "clearance_price_sent": "the markdown price we sent to SAP; not the shelf (full) price",
+    "effective_price": "the price shoppers pay in SAP right now",
+    "effective_source": "MARKDOWN (our price applies) or PROMOTION (a promotion overrides it)",
+    "markdown_valid_from / markdown_valid_to": "validity of our markdown record only; these are not promotion dates",
+}
+
+
 class ToolError(Exception):
     """A problem with the request itself; the message goes back to the LLM."""
 
@@ -44,14 +53,15 @@ class ToolContext:
     wh: WarehouseClient
     sap: httpx.Client                                  # read-only key
     allowed_regions: frozenset[str] | None = None      # None = all regions
+    run_id: str | None = None                          # pins the pipeline run; the model cannot override it
 
 
-def make_context(user: str, allowed_regions=None) -> ToolContext:
+def make_context(user: str, allowed_regions=None, run_id: str | None = None) -> ToolContext:
     """Warehouse opened read-only; SAP client carries the READ key only (the write key is never loaded)."""
     cfg = load_config()
     sap = httpx.Client(base_url=cfg.sap_base_url, headers={"X-API-Key": cfg.sap_read_key}, timeout=30)
     return ToolContext(user, get_warehouse(cfg, read_only=True), sap,
-                       None if allowed_regions is None else frozenset(allowed_regions))
+                       None if allowed_regions is None else frozenset(allowed_regions), run_id)
 
 
 # ---------------- helpers ----------------
@@ -85,6 +95,11 @@ def _regions(ctx: ToolContext, cands: list[dict], requested) -> list[str]:
     if bad:
         raise ToolError(f"regions not available: {bad}")
     return sorted(set(requested))
+
+
+def _run(ctx: ToolContext, requested: str | None) -> str | None:
+    """The run to diagnose: the one the service pinned, else what the model asked for, else None."""
+    return ctx.run_id or requested
 
 
 def _patterns(records: list[dict], keys: list[str]) -> list[dict]:
@@ -129,7 +144,7 @@ def diagnose_batch(ctx: ToolContext, week: str, skus: list[str], regions: list[s
     week, skus = _week(week), _skus(skus)
     cands = ctx.wh.get_candidates(week)
     regions = _regions(ctx, cands, regions)
-    recs = ctx.wh.get_recommendations(week, run_id)
+    recs = ctx.wh.get_recommendations(week, _run(ctx, run_id))
     conditions = _sap_get(ctx, "/pricing/conditions", week=week)["items"]
     res = diagnose(skus, regions, cands, recs, ctx.wh.get_rules(week), conditions)
     return {"as_of": _as_of(), "week": week, "run_id": recs[0]["run_id"] if recs else None,
@@ -149,10 +164,13 @@ def get_sap_conditions(ctx: ToolContext, week: str, skus: list[str], regions: li
     overridden = [c for c in items if c["effective_source"] != "MARKDOWN"]
     return {"as_of": _as_of(), "week": week, "regions": regions, "conditions_found": len(items),
             "by_effective_source": dict(Counter(f"{c['region']}:{c['effective_source']}" for c in items)),
-            "overridden": [{k: c[k] for k in ("sku", "pack_qty", "region", "price", "effective_price",
-                                              "effective_source", "valid_from", "valid_to")}
+            "overridden": [{"sku": c["sku"], "pack_qty": c["pack_qty"], "region": c["region"],
+                            "clearance_price_sent": c["price"], "effective_price": c["effective_price"],
+                            "effective_source": c["effective_source"],
+                            "markdown_valid_from": c["valid_from"], "markdown_valid_to": c["valid_to"]}
                            for c in overridden[:MAX_ITEMS]],
-            "overridden_truncated": len(overridden) > MAX_ITEMS}
+            "overridden_truncated": len(overridden) > MAX_ITEMS,
+            "fields": CONDITION_FIELDS}
 
 
 def get_api_log(ctx: ToolContext, week: str, skus: list[str], regions: list[str] | None = None,
@@ -160,6 +178,7 @@ def get_api_log(ctx: ToolContext, week: str, skus: list[str], regions: list[str]
     """What SAP answered for each record (latest answer per record), problems only, as patterns."""
     week, skus = _week(week), _skus(skus)
     regions = _regions(ctx, ctx.wh.get_candidates(week), regions)
+    run_id = _run(ctx, run_id)
     params = {"week": week} | ({"run_id": run_id} if run_id else {})
     wanted = set(skus)
     latest: dict[tuple, dict] = {}
@@ -177,7 +196,7 @@ def check_rules(ctx: ToolContext, week: str, skus: list[str], regions: list[str]
     week, skus = _week(week), _skus(skus)
     cands = ctx.wh.get_candidates(week)
     regions = _regions(ctx, cands, regions)
-    recs = ctx.wh.get_recommendations(week, run_id)
+    recs = ctx.wh.get_recommendations(week, _run(ctx, run_id))
     rules = {(r["sku"], r["pack_qty"]): r for r in ctx.wh.get_rules(week)}
     wanted = set(skus)
     found = [v for v in validate_rows(recs, rules)                      # whole week: ladder needs the Single
@@ -200,7 +219,7 @@ TOOLS = {f.__name__: f for f in (resolve_products, diagnose_batch, get_sap_condi
 _WEEK = {"type": "string", "description": "ISO week id such as 2026-W39"}
 _SKUS = {"type": "array", "items": {"type": "string"}, "description": f"sku ids, at most {MAX_SKUS}"}
 _REGIONS = {"type": "array", "items": {"type": "string"}, "description": "regions to include; default all"}
-_RUN = {"type": "string", "description": "pipeline run id; default the latest run of the week"}
+_RUN = {"type": "string", "description": "pipeline run id; leave unset unless the user names a run"}
 
 
 def _schema(name: str, description: str, props: dict, required: list[str]) -> dict:
@@ -216,7 +235,8 @@ TOOL_SCHEMAS = [
             "RULE_VIOLATION, API_REJECTED, NOT_EFFECTIVE, ... Returns counts and patterns, not per-sku rows.",
             {"week": _WEEK, "skus": _SKUS, "regions": _REGIONS, "run_id": _RUN}, ["week", "skus"]),
     _schema("get_sap_conditions", "Live read of the prices SAP holds; lists items whose effective price is "
-            "overridden (e.g. by a promotion).", {"week": _WEEK, "skus": _SKUS, "regions": _REGIONS}, ["week", "skus"]),
+            "overridden (e.g. by a promotion), with our clearance price sent and the effective price. It has no "
+            "promotion dates or priorities.", {"week": _WEEK, "skus": _SKUS, "regions": _REGIONS}, ["week", "skus"]),
     _schema("get_api_log", "What SAP answered for each submitted record; problems only, grouped by code and message.",
             {"week": _WEEK, "skus": _SKUS, "regions": _REGIONS, "run_id": _RUN}, ["week", "skus"]),
     _schema("check_rules", "Re-check the hard price rules (floor, max markdown, ladder, max weeks) on the "

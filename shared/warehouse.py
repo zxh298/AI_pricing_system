@@ -34,7 +34,8 @@ class WarehouseClient(ABC):
 
     @abstractmethod
     def get_recommendations(self, week: str, run_id: str | None = None) -> list[dict]:
-        """Engine output for a week (price_recommendations). run_id None = the latest run of that week."""
+        """Engine output for a week (price_recommendations). run_id None = the alphabetically last run id of
+        that week, which is not necessarily the newest run: callers that know the run should pass it."""
 
 
 class DuckDBWarehouse(WarehouseClient):

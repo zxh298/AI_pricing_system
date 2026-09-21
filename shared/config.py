@@ -1,6 +1,12 @@
 """All configuration comes from environment variables. Code never branches on local vs cloud."""
 import os
 from dataclasses import dataclass
+from datetime import date
+
+
+def current_week() -> str:
+    y, w, _ = date.today().isocalendar()
+    return f"{y}-W{w:02d}"
 
 
 @dataclass(frozen=True)
@@ -14,6 +20,8 @@ class Config:
     llm_provider: str
     sap_read_key: str
     sap_write_key: str
+    anthropic_model: str = "claude-haiku-4-5"     # the API key itself is read by the SDK from ANTHROPIC_API_KEY
+    default_week: str = ""                        # what "this week" means to the assistant
 
 
 def load_config() -> Config:
@@ -28,4 +36,6 @@ def load_config() -> Config:
         llm_provider=e("LLM_PROVIDER", "scripted"),
         sap_read_key=e("SAP_READ_KEY", "dev-read-key"),
         sap_write_key=e("SAP_WRITE_KEY", "dev-write-key"),
+        anthropic_model=e("ANTHROPIC_MODEL", "claude-haiku-4-5"),
+        default_week=e("DEFAULT_WEEK") or current_week(),
     )

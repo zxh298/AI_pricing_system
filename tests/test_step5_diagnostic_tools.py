@@ -1,9 +1,10 @@
 """Step 5, slice 1: deterministic diagnostic tools (no LLM, no sessions).
 
-Unit tests need nothing: DuckDB is built from the seeded generator, the engine runs for real, and SAP is
-a fake read-only HTTP transport that serves a planted scenario (VIC promotion override + rejected
-records). The mock-sap tests need the Postgres container (docker compose up -d postgres).
+Unit tests need nothing: the `env` fixture (tests/conftest.py) builds DuckDB from the seeded generator, runs
+the engine for real, and serves a planted scenario (VIC promotion override + rejected records) from a fake
+read-only SAP. The mock-sap tests need the Postgres container (docker compose up -d postgres).
 """
+import dataclasses
 import inspect
 import json
 import logging
@@ -17,61 +18,11 @@ import pytest
 os.environ["SAP_SCHEMA"] = "sap_test"
 os.environ["SAP_READ_KEY"], os.environ["SAP_WRITE_KEY"] = "rk", "wk"
 
-from jobs.data_gen.generate import WEEK, write
-from jobs.pricing_engine.engine import price_week, record_send_results, save_recommendations
+from jobs.data_gen.generate import WEEK
 from services.diagnostic_api import tools
 from services.diagnostic_api.tools import TOOL_SCHEMAS, TOOLS, ToolContext, execute_tool
 from shared import db
 from shared.warehouse import DuckDBWarehouse
-
-RUN = "run-1"
-OVERLAP_MSG = "validity overlaps existing condition record (run LEGACY-PREV-WEEK, 2026-09-14 to 2099-12-31)"
-
-
-def fake_sap(rows, results):
-    """Read-only SAP: conditions with a VIC promotion override on `promo` items, and the submission log."""
-    promo, held, log = rows["promo"], [], []
-    for i, r in enumerate(results, 1):
-        log.append({"id": i, "run_id": RUN, "week": WEEK, "sku": r["sku"], "pack_qty": str(r["pack_qty"]),
-                    "region": r["region"], "status": r["status"], "code": r["code"], "message": r["message"]})
-        if r["status"] != "ACCEPTED":
-            continue
-        price = rows["price"][(r["sku"], r["pack_qty"], r["region"])]
-        is_promo = (r["sku"], r["pack_qty"], r["region"]) in promo
-        held.append({"sku": r["sku"], "pack_qty": r["pack_qty"], "region": r["region"], "price": price,
-                     "effective_price": round(price * 0.7, 2) if is_promo else price,
-                     "effective_source": "PROMOTION" if is_promo else "MARKDOWN",
-                     "valid_from": "2026-09-21", "valid_to": "2026-09-27"})
-
-    def handler(req: httpx.Request) -> httpx.Response:
-        if req.method != "GET":
-            return httpx.Response(403, text="write key required")           # the diagnostic client is read-only
-        items = {"/pricing/conditions": held, "/pricing/submissions": log}[req.url.path]
-        return httpx.Response(200, json={"week": WEEK, "count": len(items), "items": items})
-
-    return httpx.Client(base_url="http://sap", transport=httpx.MockTransport(handler))
-
-
-@pytest.fixture(scope="module")
-def env(tmp_path_factory):
-    path = str(tmp_path_factory.mktemp("d") / "w.duckdb")
-    write(path, seed=1, with_sap_tables=True)
-    wh = DuckDBWarehouse(path)
-    rows = price_week(WEEK, wh)
-    save_recommendations(path, RUN, WEEK, rows)
-    vic = [r for r in rows if r["status"] == "PRICED" and r["region"] == "VIC" and r["pack_qty"] == 1]
-    promo = {(r["sku"], 1, "VIC") for r in vic[:3]}
-    rejected = {(r["sku"], 1, "VIC") for r in vic[3:5]}
-    results = [{"sku": r["sku"], "pack_qty": r["pack_qty"], "region": r["region"],
-                "status": "REJECTED" if (r["sku"], r["pack_qty"], r["region"]) in rejected else "ACCEPTED",
-                "code": "VALIDITY_OVERLAP" if (r["sku"], r["pack_qty"], r["region"]) in rejected else "OK",
-                "message": OVERLAP_MSG if (r["sku"], r["pack_qty"], r["region"]) in rejected else "accepted"}
-               for r in rows if r["status"] == "PRICED"]
-    record_send_results(path, RUN, WEEK, results)
-    price = {(r["sku"], r["pack_qty"], r["region"]): r["recommended_price"] for r in rows if r["status"] == "PRICED"}
-    sap = fake_sap({"promo": promo, "price": price}, results)
-    return {"path": path, "wh": wh, "ctx": ToolContext("tester", wh, sap), "sap": sap, "rows": rows,
-            "skus": sorted({r["sku"] for r in rows}), "promo": promo, "rejected": rejected}
 
 
 def call(ctx, name, **args):
@@ -93,7 +44,7 @@ def tampered(env, tmp_path, sql):
 # ======================= diagnose_batch: the canonical "VIC broken, NSW fine" scenario =======================
 def test_diagnose_batch_finds_the_planted_issues(env):
     d = call(env["ctx"], "diagnose_batch", week=WEEK, skus=env["skus"])
-    assert d["run_id"] == RUN and d["regions"] == ["NSW", "QLD", "VIC"]
+    assert d["run_id"] == env["run"] and d["regions"] == ["NSW", "QLD", "VIC"]
     assert sum(d["totals"].values()) == 138                                  # every candidate row gets a verdict
     assert d["by_region"]["VIC"]["NOT_EFFECTIVE"] == 3 and d["by_region"]["VIC"]["API_REJECTED"] == 2
     for region in ("NSW", "QLD"):
@@ -146,6 +97,44 @@ def test_no_pipeline_run_yet_means_missing_price_not_a_crash(env, tmp_path):
     assert d["patterns"][0]["reason"] == "NO_RECOMMENDATION"
 
 
+# ======================= which pipeline run is diagnosed =======================
+def two_runs(env, tmp_path):
+    """run-1 plus an older run whose id sorts later ('zzz-old', nothing sent), as in a warehouse with many runs."""
+    return tampered(env, tmp_path, "INSERT INTO price_recommendations "
+                                   "SELECT * REPLACE ('zzz-old' AS run_id, NULL AS sap_status) FROM price_recommendations")
+
+
+def test_unpinned_default_is_the_alphabetically_last_run(env, tmp_path):
+    d = call(two_runs(env, tmp_path), "diagnose_batch", week=WEEK, skus=env["skus"], regions=["VIC"])
+    assert d["run_id"] == "zzz-old" and "NOT_SENT" in {p["reason"] for p in d["patterns"]}
+
+
+def test_a_pinned_run_wins_and_the_model_cannot_override_it(env, tmp_path):
+    ctx = dataclasses.replace(two_runs(env, tmp_path), run_id=env["run"])
+    d = call(ctx, "diagnose_batch", week=WEEK, skus=env["skus"], regions=["VIC"])
+    assert d["run_id"] == env["run"] and d["by_region"]["VIC"]["NOT_EFFECTIVE"] == 3
+    d = call(ctx, "diagnose_batch", week=WEEK, skus=env["skus"], regions=["VIC"], run_id="zzz-old")
+    assert d["run_id"] == env["run"]                                         # the pin beats the model's argument
+    assert call(ctx, "check_rules", week=WEEK, skus=env["skus"], run_id="zzz-old")["run_id"] == env["run"]
+
+
+def test_without_a_pin_the_model_may_name_a_run(env, tmp_path):
+    d = call(two_runs(env, tmp_path), "diagnose_batch", week=WEEK, skus=env["skus"], regions=["VIC"], run_id=env["run"])
+    assert d["run_id"] == env["run"]
+
+
+def test_the_api_log_is_filtered_to_the_pinned_run(env):
+    asked = []
+
+    def handler(req):
+        asked.append(dict(req.url.params))
+        return httpx.Response(200, json={"items": []})
+    ctx = ToolContext("t", env["wh"], httpx.Client(base_url="http://sap", transport=httpx.MockTransport(handler)),
+                      run_id=env["run"])
+    call(ctx, "get_api_log", week=WEEK, skus=env["skus"], run_id="something-else")
+    assert asked == [{"week": WEEK, "run_id": env["run"]}]
+
+
 # ======================= the other tools =======================
 def test_resolve_products_by_brand(env):
     cands = env["wh"].get_candidates(WEEK)
@@ -160,22 +149,33 @@ def test_get_sap_conditions_lists_only_overrides(env):
     r = call(env["ctx"], "get_sap_conditions", week=WEEK, skus=env["skus"])
     assert r["conditions_found"] == 126 - 2                                          # 2 rejected are not held
     assert {(o["region"], o["effective_source"]) for o in r["overridden"]} == {("VIC", "PROMOTION")}
-    assert len(r["overridden"]) == 3 and all(o["effective_price"] < o["price"] for o in r["overridden"])
+    assert len(r["overridden"]) == 3 and all(o["effective_price"] < o["clearance_price_sent"] for o in r["overridden"])
     assert r["by_effective_source"]["VIC:PROMOTION"] == 3
+
+
+def test_condition_fields_cannot_be_misread(env):
+    r = call(env["ctx"], "get_sap_conditions", week=WEEK, skus=env["skus"])
+    for o in r["overridden"]:
+        assert set(o) == {"sku", "pack_qty", "region", "clearance_price_sent", "effective_price", "effective_source",
+                          "markdown_valid_from", "markdown_valid_to"}     # no bare "price" or "valid_*" to guess about
+    assert set(r["fields"]) == {"clearance_price_sent", "effective_price", "effective_source",
+                                "markdown_valid_from / markdown_valid_to"}
+    assert "not the shelf" in r["fields"]["clearance_price_sent"] and "not promotion dates" in r["fields"][
+        "markdown_valid_from / markdown_valid_to"]
 
 
 def test_get_api_log_groups_problems(env):
     r = call(env["ctx"], "get_api_log", week=WEEK, skus=env["skus"])
     assert r["problems"] == 2 and r["records_logged"] == 126
     assert r["patterns"] == [{"region": "VIC", "status": "REJECTED", "code": "VALIDITY_OVERLAP",
-                              "message": OVERLAP_MSG, "count": 2,
+                              "message": env["overlap_msg"], "count": 2,
                               "sample_skus": sorted(k[0] for k in env["rejected"])}]
 
 
 def test_get_api_log_keeps_the_latest_answer_per_record(env):
     # a replay that succeeded after a rejection must not still show as a problem
     def handler(req):
-        rec = {"run_id": RUN, "week": WEEK, "sku": "1", "pack_qty": "1", "region": "VIC", "message": ""}
+        rec = {"run_id": env["run"], "week": WEEK, "sku": "1", "pack_qty": "1", "region": "VIC", "message": ""}
         return httpx.Response(200, json={"items": [{"id": 1, **rec, "status": "REJECTED", "code": "X"},
                                                    {"id": 2, **rec, "status": "ACCEPTED", "code": "OK"}]})
     ctx = ToolContext("t", env["wh"], httpx.Client(base_url="http://sap", transport=httpx.MockTransport(handler)))
