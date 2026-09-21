@@ -28,6 +28,7 @@ from pydantic import BaseModel, Field
 from services.diagnostic_api.agent import run_turn
 from services.diagnostic_api.cache import ToolCache
 from services.diagnostic_api.findings import FindingsStore, render_block
+from services.diagnostic_api.knowledge import KnowledgeBase
 from services.diagnostic_api.llm import get_llm
 from services.diagnostic_api.runs import RunResolver
 from services.diagnostic_api.sessions import SessionError, SessionStore
@@ -79,19 +80,26 @@ def regions_for(user: str, raw: str) -> frozenset[str] | None:
 
 
 def create_app(store: SessionStore | None = None, llm_factory=get_llm, ctx_factory=None, runs=None, cache=None,
-               findings=None) -> FastAPI:
+               findings=None, kb=None, warm_knowledge: bool = False) -> FastAPI:
     """`llm_factory(week)`, `ctx_factory(user, allowed_regions)`, `runs` (finds the newest pipeline run of a week),
-    `cache` and `findings` are injectable so tests need no key, SAP or pipeline state."""
+    `cache`, `findings` and `kb` (the knowledge base) are injectable so tests need no key, SAP, pipeline state or
+    embedding model. `warm_knowledge` loads the embedding model at startup, so the first question does not wait for it."""
     store = store or SessionStore()
     runs = runs or RunResolver()
     cache = cache or ToolCache()
     findings = findings or FindingsStore()
+    kb = kb or KnowledgeBase()
     owns_ctx = ctx_factory is None
     ctx_factory = ctx_factory or (lambda user, regions: make_context(user, regions))
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         store.ensure_schema()
+        if warm_knowledge:
+            try:
+                kb.warm()
+            except Exception:                                                # noqa: BLE001 - search_docs will report it
+                log.warning("could not load the embedding model at startup", exc_info=True)
         yield
 
     app = FastAPI(title="diagnostic-api", lifespan=lifespan)
@@ -130,7 +138,7 @@ def create_app(store: SessionStore | None = None, llm_factory=get_llm, ctx_facto
             allowed = regions_for(user, cfg.user_regions)
             base = ctx_factory(user, allowed)
             known = findings.list(week=s["week"], status="open", allowed_regions=allowed)   # shown to the model by us
-            ctx = dataclasses.replace(base, state=state, runs=runs, cache=cache, findings=findings)   # a copy for this turn
+            ctx = dataclasses.replace(base, state=state, runs=runs, cache=cache, findings=findings, kb=kb)   # a copy for this turn
             try:
                 out = run_turn(body.text, ctx, llm_factory(s["week"]), s["week"], history=history,
                                state_block="\n\n".join(b for b in (state.render(), render_block(known)) if b))
@@ -181,6 +189,6 @@ def __getattr__(name: str):
     development. Importing this module (tests, tooling) therefore has no side effects on the environment."""
     if name == "app":
         load_dotenv()
-        globals()["app"] = create_app()
+        globals()["app"] = create_app(warm_knowledge=True)
         return globals()["app"]
     raise AttributeError(name)

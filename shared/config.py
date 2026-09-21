@@ -25,6 +25,10 @@ class Config:
     session_idle_minutes: int = 120               # a session expires after this long without a message
     user_regions: str = ""                        # JSON {"user": ["REGION", ...]}; users not listed see every region
     tool_cache_ttl_seconds: int = 300             # how long a live (SAP) tool result may be reused
+    embedding_provider: str = "fastembed"         # fastembed | hash (hash is for tests: it does not understand meaning)
+    embedding_model: str = "BAAI/bge-small-en-v1.5"
+    embedding_cache_dir: str = ""                 # where the model is stored; default ~/.cache/ai_pricing_fastembed
+    search_min_score: float = 0.65                # documents less similar than this are not returned by similarity search
 
 
 def load_config() -> Config:
@@ -44,4 +48,8 @@ def load_config() -> Config:
         session_idle_minutes=int(e("SESSION_IDLE_MINUTES", "120")),
         user_regions=e("USER_REGIONS", ""),
         tool_cache_ttl_seconds=int(e("TOOL_CACHE_TTL_SECONDS", "300")),
+        embedding_provider=e("EMBEDDING_PROVIDER", "fastembed"),
+        embedding_model=e("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5"),
+        embedding_cache_dir=e("EMBEDDING_CACHE_DIR", ""),
+        search_min_score=float(e("SEARCH_MIN_SCORE", "0.65")),
     )

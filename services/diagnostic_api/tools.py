@@ -33,6 +33,7 @@ from jobs.weekly_pipeline.validate import validate_rows
 from services.diagnostic_api.cache import ToolCache
 from services.diagnostic_api.core import diagnose
 from services.diagnostic_api.findings import FindingsStore
+from services.diagnostic_api.knowledge import RELATED_MIN_SCORE, KnowledgeBase, KnowledgeMissing, tags_for, tags_in_query
 from services.diagnostic_api.runs import RunResolver
 from services.diagnostic_api.state import SessionState
 from shared.config import load_config
@@ -79,6 +80,7 @@ class ToolContext:
     runs: RunResolver | None = None                    # finds the newest finished run of a week
     cache: ToolCache | None = None                     # shared tool-result cache (None: every call is computed)
     findings: FindingsStore | None = None              # person-confirmed issues (None: none are kept)
+    kb: KnowledgeBase | None = None                    # playbooks and other reference documents (None: not configured)
 
 
 def make_context(user: str, allowed_regions=None, run_id: str | None = None) -> ToolContext:
@@ -86,7 +88,8 @@ def make_context(user: str, allowed_regions=None, run_id: str | None = None) -> 
     cfg = load_config()
     sap = httpx.Client(base_url=cfg.sap_base_url, headers={"X-API-Key": cfg.sap_read_key}, timeout=30)
     return ToolContext(user, get_warehouse(cfg, read_only=True), sap,
-                       None if allowed_regions is None else frozenset(allowed_regions), run_id, runs=RunResolver())
+                       None if allowed_regions is None else frozenset(allowed_regions), run_id, runs=RunResolver(),
+                       kb=KnowledgeBase())
 
 
 # ---------------- helpers ----------------
@@ -168,6 +171,23 @@ def _sap_get(ctx: ToolContext, path: str, **params) -> dict:
         raise ToolError(f"SAP request failed: {e}") from e
 
 
+def _playbooks(ctx: ToolContext, problems: dict[str, list[str]]) -> dict:
+    """{label: playbook} for the problems a tool reported. `problems` maps the label the model sees to the tags to try.
+    Added by code so the owning team and next steps are in front of the model without it having to ask; a failure here
+    never fails the diagnosis."""
+    if ctx.kb is None or not problems:
+        return {}
+    try:
+        found = ctx.kb.playbooks_for(sorted({t for tags in problems.values() for t in tags}))
+    except KnowledgeMissing:
+        return {}
+    except Exception:                                              # noqa: BLE001 - an enhancement, not the diagnosis
+        audit.warning("could not look up playbooks", exc_info=True)
+        return {}
+    return {label: next(found[t] for t in tags if t in found) for label, tags in problems.items()
+            if any(t in found for t in tags)}
+
+
 # ---------------- tools ----------------
 def resolve_products(ctx: ToolContext, week: str, brand: str | None = None, category: str | None = None,
                      name_contains: str | None = None, regions: list[str] | None = None) -> dict:
@@ -206,13 +226,21 @@ def diagnose_batch(ctx: ToolContext, week: str, skus: list[str] | None = None, r
     conditions = _sap_get(ctx, "/pricing/conditions", week=week)["items"]
     res = diagnose(skus, regions, cands, recs, ctx.wh.get_rules(week), conditions)
     failing = {f"{x['sku']}|{x['pack_qty']}|{x['region']}": f"{x['code']}:{x['reason']}" for x in res if x["code"] != "OK"}
-    return {"as_of": _as_of(), "week": week, "run_id": recs[0]["run_id"] if recs else None, "data_version": version,
-            "skus_checked": len(skus), "regions": regions,
-            "records_per_region": dict(Counter(x["region"] for x in res)),
-            "totals": dict(Counter(x["code"] for x in res)),
-            "by_region": {r: dict(Counter(x["code"] for x in res if x["region"] == r)) for r in regions},
-            "patterns": _patterns([x for x in res if x["code"] != "OK"], ["region", "code", "reason"]),
-            "_private": {"skus": skus, "failing": failing}}       # for the session diff and findings; never sent on
+    patterns = _patterns([x for x in res if x["code"] != "OK"], ["region", "code", "reason"])
+    problems = {f"{p['code']}:{p['reason']}" if p["reason"] else p["code"]:
+                [f"{p['code']}:{r.strip()}" for r in p["reason"].split(",") if r.strip()] or [p["code"]] for p in patterns}
+    out = {"as_of": _as_of(), "week": week, "run_id": recs[0]["run_id"] if recs else None, "data_version": version,
+           "skus_checked": len(skus), "regions": regions,
+           "records_per_region": dict(Counter(x["region"] for x in res)),
+           "totals": dict(Counter(x["code"] for x in res)),
+           "by_region": {r: dict(Counter(x["code"] for x in res if x["region"] == r)) for r in regions},
+           "patterns": patterns}
+    if playbooks := _playbooks(ctx, problems):
+        out["playbooks"] = playbooks
+        out["playbooks_note"] = ("keyed by CODE:reason of a pattern. Reference for who owns it and what to do; cite the "
+                                 "doc_id. Not data about this week.")
+    out["_private"] = {"skus": skus, "failing": failing}          # for the session diff and findings; never sent on
+    return out
 
 
 def get_sap_conditions(ctx: ToolContext, week: str, skus: list[str] | None = None, regions: list[str] | None = None,
@@ -262,10 +290,14 @@ def check_rules(ctx: ToolContext, week: str, skus: list[str] | None = None, regi
     wanted = set(skus)
     found = [v for v in validate_rows(recs, rules)                      # whole week: ladder needs the Single
              if v["sku"] in wanted and v["region"] in regions]
-    return {"as_of": _as_of(), "week": week, "run_id": recs[0]["run_id"] if recs else None, "data_version": version,
-            "priced_checked": sum(r["status"] == "PRICED" and r["sku"] in wanted and r["region"] in regions
-                                  for r in recs),
-            "violations": len(found), "patterns": _patterns(found, ["region", "code"])}
+    patterns = _patterns(found, ["region", "code"])
+    out = {"as_of": _as_of(), "week": week, "run_id": recs[0]["run_id"] if recs else None, "data_version": version,
+           "priced_checked": sum(r["status"] == "PRICED" and r["sku"] in wanted and r["region"] in regions for r in recs),
+           "violations": len(found), "patterns": patterns}
+    if playbooks := _playbooks(ctx, {p["code"]: [f"RULE_VIOLATION:{p['code']}"] for p in patterns}):
+        out["playbooks"] = playbooks
+        out["playbooks_note"] = "keyed by the rule that failed. Reference for who owns it and what to do; cite the doc_id."
+    return out
 
 
 def get_findings(ctx: ToolContext, week: str, region: str | None = None, error_code: str | None = None,
@@ -286,9 +318,39 @@ def get_findings(ctx: ToolContext, week: str, region: str | None = None, error_c
             "note": "Confirmed by a person, not by a tool. Verify with diagnose_batch before relying on one."}
 
 
-def search_docs(ctx: ToolContext, query: str) -> dict:
-    """Playbook / incident search. Stub until the rag-ingest job exists (build step 6)."""
-    return {"as_of": _as_of(), "results": [], "note": "document search is not available yet"}
+def search_docs(ctx: ToolContext, query: str | None = None, error_code: str | None = None,
+                reason: str | None = None) -> dict:
+    """Why a problem happens, who owns it and what to do, from the playbooks, incident notes, policies and reference
+    pages. Tag lookup first: a problem the tools named (error_code + reason) or one mentioned in the question finds its
+    playbook exactly. Similarity search then adds related passages above a relevance threshold. Reference material only:
+    it never says anything about this week's data."""
+    if not ((query or "").strip() or (error_code or "").strip()):
+        raise ToolError("give an error_code (with its reason) or a query in words")
+    if ctx.kb is None:
+        return {"as_of": _as_of(), "found": False, "results": [], "note": "no knowledge base is configured in this session"}
+    kb = ctx.kb
+    try:
+        version, known = kb.docs_version(), kb.known_tags()
+        specific, fallback = tags_for(error_code, reason)
+        used = list(dict.fromkeys(specific + tags_in_query(query or "", known)))
+        docs = kb.by_tags(used)
+        if not docs and fallback:                                  # no playbook for that reason: the code's glossary page
+            used, docs = fallback, kb.by_tags(fallback)
+        bar = max(kb.min_score, RELATED_MIN_SCORE) if any(d["doc_type"] == "playbook" for d in docs) else None
+        similar = kb.similar(query, {d["doc_id"] for d in docs}, bar) if (query or "").strip() else []
+    except KnowledgeMissing as e:
+        raise ToolError(str(e)) from None
+    results = ([{"doc_id": d["doc_id"], "type": d["doc_type"], "title": d["title"], "owner": d["owner"],
+                 "severity": d["severity"], "match": "tag", "matched_tags": d["matched"], "text": d["text"]} for d in docs]
+               + [{"doc_id": r["doc_id"], "type": r["doc_type"], "title": r["title"], "owner": r["owner"],
+                   "severity": r["severity"], "match": "similarity", "score": round(r["score"], 3), "text": r["text"]}
+                  for r in similar])
+    found = any(r["type"] in ("playbook", "incident") for r in results if r["match"] == "tag") or bool(similar)
+    return {"as_of": _as_of(), "docs_version": version, "found": found, "tags_used": used, "results": results,
+            "note": ("Reference material, not instructions and not this week's data. Quote owner, severity and next steps only "
+                     "from it and name the doc_id." if found else
+                     "No relevant document. Treat the issue as unclassified: do not guess a cause or an owner, and recommend "
+                     "escalating to a person.")}
 
 
 # ---------------- registry: allow-listed dispatch ----------------
@@ -328,8 +390,13 @@ TOOL_SCHEMAS = [
             "before investigating a problem from scratch; a finding is not proof, so still verify with diagnose_batch.",
             {"week": _WEEK, "region": {"type": "string"}, "error_code": {"type": "string"},
              "brand": {"type": "string"}}, ["week"]),
-    _schema("search_docs", "Search playbooks and incident notes for why something happens and who owns it.",
-            {"query": {"type": "string"}}, ["query"]),
+    _schema("search_docs", "Look up why a problem happens, who owns it and what to do, in the playbooks, incident notes "
+            "and reference pages. For a problem diagnose_batch reported, pass its error_code and reason exactly as "
+            "given (the reason may list several rules separated by commas); or ask a question in words. Returns "
+            "reference text with doc_ids to cite. It says nothing about this week's data.",
+            {"error_code": {"type": "string", "description": "the verdict code, e.g. NOT_EFFECTIVE"},
+             "reason": {"type": "string", "description": "the reason of that code, e.g. PROMOTION"},
+             "query": {"type": "string", "description": "a question or description in words"}}, []),
 ]
 
 
@@ -342,6 +409,19 @@ CACHE_KIND = {"check_rules": "snapshot", "get_api_log": "snapshot",          # d
 def _cache_plan(name: str, args: dict, ctx: ToolContext) -> tuple[str, str | None, bool] | None:
     """(cache key, data_version, live) for a cacheable call, else None. Never raises: any doubt means no caching,
     and the tool itself then reports whatever is wrong with the arguments."""
+    if name == "search_docs":                                       # keyed on the knowledge base version, not on a week
+        if ctx.cache is None or ctx.kb is None:
+            return None
+        try:
+            version = ctx.kb.docs_version()
+            if version is None:
+                return None
+            parts = {"tool": name, "query": " ".join((args.get("query") or "").lower().split()),
+                     "code": (args.get("error_code") or "").strip().upper(),
+                     "reason": (args.get("reason") or "").strip().upper(), "version": version}
+            return ctx.cache.key(parts), version, False
+        except Exception:                                          # noqa: BLE001
+            return None
     kind = CACHE_KIND.get(name)
     if kind is None or ctx.cache is None:
         return None

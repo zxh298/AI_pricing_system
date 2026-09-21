@@ -403,7 +403,7 @@ Each service/job has its own Dockerfile and requirements; build context is the r
 
 ## 9. Build order (each step must run end to end before moving on)
 
-**Status: steps 1-5 done and tested; step 6 in progress (corpus + loader done, ingest job / `search_docs` next); steps 7-9 not started.** Step 5 as built: section 17.
+**Status: steps 1-5 done and tested; step 6 in progress (corpus, loader, chunker, embedder, ingest job, `search_docs` tool and prompt change done; retrieval evaluation set next); steps 7-9 not started.** Step 5 as built: section 17.
 
 1. **Synthetic data** → DuckDB: SKUs (fictional brands), stores/regions, sales, inventory,
    weekly candidate list, business rules. Seeded so scenarios are reproducible.
@@ -419,7 +419,26 @@ Each service/job has its own Dockerfile and requirements; build context is the r
    Postgres (schema `knowledge`); corpus in the tracked `playbooks/` folder (27 documents: playbooks, incidents,
    policies, reference; README explains format and tags); tag-first lookup by `CODE:reason`, similarity search as
    fallback with a relevance threshold; a test keeps every emittable code covered by a playbook. Done so far:
-   corpus + `jobs/rag_ingest/corpus.py` loader and `tests/test_step6_corpus.py`.
+   corpus + loader (`jobs/rag_ingest/corpus.py`), section chunker (`chunker.py`, ~110 chunks, median ~350 chars),
+   embedder interface (`shared/embedding.py`: `fastembed` = local BAAI/bge-small-en-v1.5, 384-wide, ONNX, no key;
+   `hash` = offline stand-in for tests), schema (`shared/knowledge_schema.py`: `docs`, `chunks` with a pgvector
+   column, `kb_meta.docs_version`) and the incremental, transactional ingest job (`python -m jobs.rag_ingest`;
+   skips unchanged documents, re-embeds on content or model change, deletes removed documents).
+   Observed with the real model: correct playbook first for 4 of 5 on-topic probes and in the top 3 for the fifth
+   (an HTTP 429 question ranked the rejected-request playbook above the transient-errors one, which is why tag lookup
+   comes first); on-topic top scores 0.66-0.84 but off-topic questions score 0.45-0.66, so a similarity threshold
+   alone cannot separate them. Threshold and any keyword support are to be tuned on the retrieval evaluation set.
+   `pgvector` needs `CREATE EXTENSION vector` (superuser locally; `cloudsqlsuperuser` once on Cloud SQL).
+   `search_docs` (as built): tag lookup first (`tags_for` for a named code+reason, `tags_in_query` recognises
+   reasons and HTTP numbers in free text), similarity fallback with `SEARCH_MIN_SCORE` (default 0.65; only very close
+   passages, 0.80, are added once a tag found a playbook); returns `found: false` with an "unclassified" note when
+   nothing is relevant; cached as a snapshot keyed on `docs_version`. `diagnose_batch` and `check_rules` also attach,
+   in code, the playbook for each problem they report (id, owning team, severity, "What to do"), by tag only (no
+   embedding model needed); a knowledge-base failure never fails a diagnosis. The server loads the embedding model
+   at startup. Live finding: with only "call search_docs for each pattern" in the prompt, Haiku skipped the call
+   and invented an explanation; attaching the playbook in code fixed it. Open: the threshold cannot separate
+   "how many bottles did we sell last week?" (0.66) from a borderline on-topic question (0.66); tune on the
+   retrieval evaluation set (6d).
 7. **ui:** Streamlit chat; expandable panel showing tool calls per answer.
 8. **infra:** IAM script and deploy script for GCP.
 9. Optional: deploy to Cloud Run with a budget alert.

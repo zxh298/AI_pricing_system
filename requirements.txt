@@ -9,3 +9,4 @@ uvicorn
 httpx
 psycopg[binary]
 anthropic
+fastembed
