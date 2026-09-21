@@ -103,8 +103,9 @@ def test_the_model_cannot_pass_context_or_permissions(env):
 
 def test_system_prompt_tells_the_model_to_report_everything_and_not_to_invent():
     prompt = system_prompt(WEEK)
-    for rule in ("Report every pattern", "contradict the user's premise", "not a shelf price", "not promotion dates",
-                 "Never judge"):
+    for rule in ("mention every pattern", "region by region", "contradict the user's premise", "not a shelf price",
+                 "no tool gives promotion dates", "Never judge", "do not add numbers up", "Start with the finding",
+                 "do not name teams or owners"):
         assert rule in prompt
 
 
@@ -189,6 +190,27 @@ def test_dotenv_loader_strips_comments_and_keeps_real_env(tmp_path, monkeypatch)
     monkeypatch.delenv("FOO_A")
     monkeypatch.delenv("FOO_B")
     chat.load_dotenv(str(tmp_path / "missing.env"))                          # a missing file is fine
+
+
+def test_the_server_app_reads_dotenv_only_when_first_used(tmp_path, monkeypatch):
+    import os
+
+    import services.diagnostic_api.app as app_module
+    from fastapi import FastAPI
+    app_module.__dict__.pop("app", None)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("APP_TEST_LOADED=yes   # local dev value\n")
+    monkeypatch.setenv("APP_TEST_LOADED", "x")
+    monkeypatch.delenv("APP_TEST_LOADED")                                        # makes teardown remove it again
+    try:
+        assert "app" not in vars(app_module) and "APP_TEST_LOADED" not in os.environ   # importing did nothing
+        built = app_module.app                                                   # what uvicorn asks for
+        assert isinstance(built, FastAPI) and os.environ["APP_TEST_LOADED"] == "yes"
+        assert app_module.app is built                                           # built once
+        with pytest.raises(AttributeError):
+            app_module.nothing_else
+    finally:
+        app_module.__dict__.pop("app", None)
 
 
 def test_cli_runs_the_offline_demo(env, monkeypatch, capsys):

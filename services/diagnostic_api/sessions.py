@@ -111,14 +111,9 @@ class SessionStore:
         return row["version"]
 
 
-def transcript_pairs(history: list[dict]) -> list[dict]:
-    """[{question, answer}] per turn, from a stored message list (what a user may see of a session)."""
-    pairs: list[dict] = []
-    for m in history:
-        if m["role"] == "user" and isinstance(m["content"], str):
-            pairs.append({"question": m["content"], "answer": ""})
-        elif m["role"] == "assistant" and pairs:
-            said = "".join(b["text"] for b in m["content"] if b["type"] == "text")
-            if said and not any(b["type"] == "tool_use" for b in m["content"]):
-                pairs[-1]["answer"] = said
-    return pairs
+    def conversation(self, session_id: str) -> list[dict]:
+        """[{question, answer}] for every turn so far, from the audit log (complete even after compaction)."""
+        with db.connect(self.url) as con:
+            rows = con.execute(f"SELECT question, answer FROM {self.s}.turn_transcripts WHERE session_id = %s "
+                               "ORDER BY turn_no", (session_id,)).fetchall()
+        return rows

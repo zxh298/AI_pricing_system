@@ -8,10 +8,11 @@
 Identity comes from the X-User header only (a stand-in for IAP: on Cloud Run the platform sets it after
 authenticating). It is never read from a body, a query string or the model. What a user may see comes from
 USER_REGIONS and is injected into the tools; the model cannot change it.
-Run:  uvicorn services.diagnostic_api.app:app --port 8000
+Run:  uvicorn services.diagnostic_api.app:app --port 8000     (reads .env from the current directory)
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 from contextlib import asynccontextmanager
@@ -22,9 +23,12 @@ from pydantic import BaseModel, Field
 
 from services.diagnostic_api.agent import run_turn
 from services.diagnostic_api.llm import get_llm
-from services.diagnostic_api.sessions import SessionError, SessionStore, transcript_pairs
+from services.diagnostic_api.runs import RunResolver
+from services.diagnostic_api.sessions import SessionError, SessionStore
+from services.diagnostic_api.state import SessionState, compact_history
 from services.diagnostic_api.tools import make_context
 from shared.config import load_config
+from shared.envfile import load_dotenv
 
 log = logging.getLogger("diagnostic.api")
 
@@ -49,9 +53,11 @@ def regions_for(user: str, raw: str) -> frozenset[str] | None:
     return None if regions is None else frozenset(regions)
 
 
-def create_app(store: SessionStore | None = None, llm_factory=get_llm, ctx_factory=None) -> FastAPI:
-    """`llm_factory(week)` and `ctx_factory(user, allowed_regions)` are injectable so tests need no key or SAP."""
+def create_app(store: SessionStore | None = None, llm_factory=get_llm, ctx_factory=None, runs=None) -> FastAPI:
+    """`llm_factory(week)`, `ctx_factory(user, allowed_regions)` and `runs` (finds the newest pipeline run of a
+    week) are injectable so tests need no key, SAP or pipeline state."""
     store = store or SessionStore()
+    runs = runs or RunResolver()
     owns_ctx = ctx_factory is None
     ctx_factory = ctx_factory or (lambda user, regions: make_context(user, regions))
 
@@ -78,9 +84,11 @@ def create_app(store: SessionStore | None = None, llm_factory=get_llm, ctx_facto
     @app.get("/sessions/{session_id}")
     def read_session(session_id: str, user: str = Depends(current_user)):
         s = store.get(session_id, user, load_config().default_week)
+        groups = {h: {"skus": len(g["skus"]), "label": g["label"], "week": g["week"], "regions": g["regions"]}
+                  for h, g in SessionState(s["state"]).groups.items()}
         return {"session_id": s["session_id"], "week": s["week"], "turns": s["version"],
                 "created_at": s["created_at"], "last_active_at": s["last_active_at"], "expires_at": s["expires_at"],
-                "conversation": transcript_pairs(s["history"])}
+                "groups": groups, "conversation": store.conversation(session_id)}
 
     @app.post("/sessions/{session_id}/messages")
     def post_message(session_id: str, body: NewMessage, user: str = Depends(current_user)):
@@ -88,22 +96,34 @@ def create_app(store: SessionStore | None = None, llm_factory=get_llm, ctx_facto
         store.get(session_id, user, cfg.default_week)                        # 404 / 410 before taking the lock
         with store.turn_lock(session_id):
             s = store.get(session_id, user, cfg.default_week)                # latest version, now that we hold the lock
-            ctx = ctx_factory(user, regions_for(user, cfg.user_regions))
+            state = SessionState(s["state"])
+            history, dropped = compact_history(s["history"])                 # older turns: question + answer only
+            state.note_dropped(dropped)
+            base = ctx_factory(user, regions_for(user, cfg.user_regions))
+            ctx = dataclasses.replace(base, state=state, runs=runs)          # a copy for this turn; `base` may be shared
             try:
-                out = run_turn(body.text, ctx, llm_factory(s["week"]), s["week"], history=s["history"])
+                out = run_turn(body.text, ctx, llm_factory(s["week"]), s["week"], history=history,
+                               state_block=state.render())
             except Exception:                                                # noqa: BLE001 - nothing was saved
                 log.exception("turn failed in session %s", session_id)
                 raise HTTPException(502, "the assistant is unavailable; nothing was saved") from None
             finally:
                 if owns_ctx:
-                    ctx.sap.close()
-            turn = store.save_turn(s, state=s["state"], history=out["messages"], question=body.text,
+                    base.sap.close()
+            turn = store.save_turn(s, state=state.to_json(), history=out["messages"], question=body.text,
                                    answer=out["answer"], tool_calls=out["tool_calls"],
-                                   messages=out["messages"][len(s["history"]):])
+                                   messages=out["messages"][len(history):])
         return {"turn": turn, "answer": out["answer"], "tool_calls": out["tool_calls"], "steps": out["steps"],
                 "escalated": out["escalated"], "truncated": out["truncated"]}
 
     return app
 
 
-app = create_app()
+def __getattr__(name: str):
+    """`uvicorn services.diagnostic_api.app:app` builds the app on first use, after reading .env for local
+    development. Importing this module (tests, tooling) therefore has no side effects on the environment."""
+    if name == "app":
+        load_dotenv()
+        globals()["app"] = create_app()
+        return globals()["app"]
+    raise AttributeError(name)

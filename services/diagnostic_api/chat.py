@@ -10,23 +10,12 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
 
 from services.diagnostic_api.agent import run_turn
 from services.diagnostic_api.llm import get_llm
 from services.diagnostic_api.tools import make_context
 from shared.config import load_config
-
-
-def load_dotenv(path: str = ".env") -> None:
-    """Minimal .env reader: KEY=VALUE lines, inline ' #' comments stripped; real env vars win."""
-    if not os.path.exists(path):
-        return
-    for line in open(path):
-        line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.split(" #")[0].strip())
+from shared.envfile import load_dotenv
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -34,7 +23,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("question")
     ap.add_argument("--week", default=None, help="default: DEFAULT_WEEK, else today's ISO week")
-    ap.add_argument("--run-id", default=None, help="pipeline run to diagnose (default: alphabetically last run of the week)")
+    ap.add_argument("--run-id", default=None, help="pin a pipeline run (default: the newest finished run of the week)")
     ap.add_argument("--user", default="cli")
     ap.add_argument("--quiet", action="store_true", help="hide the tool call log")
     args = ap.parse_args(argv)

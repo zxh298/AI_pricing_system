@@ -45,6 +45,8 @@ def tampered(env, tmp_path, sql):
 def test_diagnose_batch_finds_the_planted_issues(env):
     d = call(env["ctx"], "diagnose_batch", week=WEEK, skus=env["skus"])
     assert d["run_id"] == env["run"] and d["regions"] == ["NSW", "QLD", "VIC"]
+    assert d["records_per_region"] == {"NSW": 46, "QLD": 46, "VIC": 46}                # totals come from code, not the model
+    assert all(sum(d["by_region"][r].values()) == n for r, n in d["records_per_region"].items())
     assert sum(d["totals"].values()) == 138                                  # every candidate row gets a verdict
     assert d["by_region"]["VIC"]["NOT_EFFECTIVE"] == 3 and d["by_region"]["VIC"]["API_REJECTED"] == 2
     for region in ("NSW", "QLD"):
@@ -156,12 +158,10 @@ def test_get_sap_conditions_lists_only_overrides(env):
 def test_condition_fields_cannot_be_misread(env):
     r = call(env["ctx"], "get_sap_conditions", week=WEEK, skus=env["skus"])
     for o in r["overridden"]:
-        assert set(o) == {"sku", "pack_qty", "region", "clearance_price_sent", "effective_price", "effective_source",
-                          "markdown_valid_from", "markdown_valid_to"}     # no bare "price" or "valid_*" to guess about
-    assert set(r["fields"]) == {"clearance_price_sent", "effective_price", "effective_source",
-                                "markdown_valid_from / markdown_valid_to"}
-    assert "not the shelf" in r["fields"]["clearance_price_sent"] and "not promotion dates" in r["fields"][
-        "markdown_valid_from / markdown_valid_to"]
+        assert set(o) == {"sku", "pack_qty", "region", "clearance_price_sent", "effective_price", "effective_source"}
+    assert "valid_from" not in json.dumps(r) and "valid_to" not in json.dumps(r)   # no dates the model could take for promotion dates
+    assert set(r["fields"]) == {"clearance_price_sent", "effective_price", "effective_source", "not available"}
+    assert "not the shelf" in r["fields"]["clearance_price_sent"] and "promotion dates" in r["fields"]["not available"]
 
 
 def test_get_api_log_groups_problems(env):

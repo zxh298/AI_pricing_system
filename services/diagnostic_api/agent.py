@@ -27,28 +27,34 @@ tool: diagnose_batch for the status of records, check_rules for any question abo
 price ladders.
 - State only facts that appear in tool results. Quote counts exactly. Do not invent prices, skus, dates, \
 priorities or causes. Use each field for what its name and the tool's "fields" note say; a clearance price is \
-not a shelf price, and markdown validity dates are not promotion dates.
-- Report every pattern diagnose_batch returns, including ones unrelated to the question, so nothing is hidden. \
-If the results contradict the user's premise (for example a region they call fine has problems), say so plainly \
-instead of agreeing.
+not a shelf price, and no tool gives promotion dates.
+- Your answer must mention every pattern diagnose_batch returns, region by region, including ones unrelated to \
+the question. If a problem appears in several regions, say so for each one. If the results contradict the user's \
+premise (for example a region they call fine has problems), say so plainly instead of agreeing.
+- For totals use the counts the tools give (records_per_region, by_region, totals); do not add numbers up \
+yourself.
+- Start with the finding. Do not narrate what you are doing or say that you have the answer.
 - Anything about current status must come from a tool call made in this turn. Earlier turns only tell you \
 what the user is referring to.
-- When the user names a brand, category or product, call resolve_products first and use the skus it returns.
+- When the user names a brand, category or product, call resolve_products first. If it returns a group_id, \
+pass that to the other tools instead of listing skus; otherwise use the skus it returns.
 - Prefer batch tools over many small calls. Report patterns (counts by region, code and reason) with a few \
 example skus, not long lists.
 - If the evidence does not match a known cause, say the issue is unclassified, offer hypotheses clearly \
 labelled low confidence, and recommend escalating to a person. Never present a hypothesis as a finding.
-- Document search is not available yet, so do not claim to know playbooks or who owns a problem."""
+- Document search is not available yet, so do not claim to know playbooks, and do not name teams or owners or \
+say whom to contact. You may say what would need to change (for example "the promotion in SAP"), not who does it."""
 
 
-def system_prompt(week: str) -> str:
-    return SYSTEM.format(week=week)
+def system_prompt(week: str, state_block: str = "") -> str:
+    """The rules plus, when the session has any, the state block the service keeps (groups, earlier questions)."""
+    return SYSTEM.format(week=week) + (f"\n\n{state_block}" if state_block else "")
 
 
 def run_turn(question: str, ctx: ToolContext, llm: LLM, week: str, history: list[dict] | None = None,
-             max_steps: int = MAX_STEPS) -> dict:
+             max_steps: int = MAX_STEPS, state_block: str = "") -> dict:
     """One user turn. Returns {"answer", "messages", "tool_calls", "steps", "escalated", "truncated"}."""
-    system = system_prompt(week)
+    system = system_prompt(week, state_block)
     messages = list(history or []) + [{"role": "user", "content": question}]
     calls: list[dict] = []
     for step in range(1, max_steps + 1):

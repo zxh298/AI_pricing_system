@@ -57,7 +57,9 @@ def canonical_script(week: str, brand: str = "Brand A", regions: tuple[str, ...]
     regions = list(regions)
 
     def diagnose(msgs):
-        return [tool_use("diagnose_batch", {"week": week, "skus": last_tool_results(msgs)[0]["skus"], "regions": regions})]
+        found = last_tool_results(msgs)[0]                     # with session state, resolve_products returns a handle
+        which = {"group_id": found["group_id"]} if "group_id" in found else {"skus": found["skus"]}
+        return [tool_use("diagnose_batch", {"week": week, **which, "regions": regions})]
 
     def follow_up(msgs):
         d = last_tool_results(msgs)[0]

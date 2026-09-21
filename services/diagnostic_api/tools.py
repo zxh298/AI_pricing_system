@@ -5,6 +5,10 @@ Rules (docs/PROJECT_CONTEXT.md section 3.4):
     or the pipeline's validation rules.
   * User and permissions arrive in a ToolContext injected by the service, never in LLM arguments.
   * Batch tools collapse identical per-SKU results into patterns (count + a few sample skus).
+  * Tools take `skus` or a `group_id` (a handle the session state holds); groups say which products, never
+    what their status is, so status is re-queried on every call.
+  * Which pipeline run is diagnosed is decided by the service (pinned run, else the newest finished run for the
+    week), never by the model.
   * Dispatch is allow-listed; every call writes one audit log line; failures come back as
     is_error results for the LLM instead of raising.
   * SAP is only ever read (GET, read key); this module has no way to write a price.
@@ -23,6 +27,8 @@ import httpx
 
 from jobs.weekly_pipeline.validate import validate_rows
 from services.diagnostic_api.core import diagnose
+from services.diagnostic_api.runs import RunResolver
+from services.diagnostic_api.state import SessionState
 from shared.config import load_config
 from shared.warehouse import WarehouseClient, get_warehouse
 
@@ -39,7 +45,7 @@ CONDITION_FIELDS = {
     "clearance_price_sent": "the markdown price we sent to SAP; not the shelf (full) price",
     "effective_price": "the price shoppers pay in SAP right now",
     "effective_source": "MARKDOWN (our price applies) or PROMOTION (a promotion overrides it)",
-    "markdown_valid_from / markdown_valid_to": "validity of our markdown record only; these are not promotion dates",
+    "not available": "promotion dates, priorities and names: no tool returns them, so do not state them",
 }
 
 
@@ -54,6 +60,8 @@ class ToolContext:
     sap: httpx.Client                                  # read-only key
     allowed_regions: frozenset[str] | None = None      # None = all regions
     run_id: str | None = None                          # pins the pipeline run; the model cannot override it
+    state: SessionState | None = None                  # the session's groups and scope (None: no session)
+    runs: RunResolver | None = None                    # finds the newest finished run of a week
 
 
 def make_context(user: str, allowed_regions=None, run_id: str | None = None) -> ToolContext:
@@ -61,7 +69,7 @@ def make_context(user: str, allowed_regions=None, run_id: str | None = None) -> 
     cfg = load_config()
     sap = httpx.Client(base_url=cfg.sap_base_url, headers={"X-API-Key": cfg.sap_read_key}, timeout=30)
     return ToolContext(user, get_warehouse(cfg, read_only=True), sap,
-                       None if allowed_regions is None else frozenset(allowed_regions), run_id)
+                       None if allowed_regions is None else frozenset(allowed_regions), run_id, runs=RunResolver())
 
 
 # ---------------- helpers ----------------
@@ -77,7 +85,7 @@ def _week(week) -> str:
 
 def _skus(skus) -> list[str]:
     if not isinstance(skus, list) or not skus or not all(isinstance(s, str) for s in skus):
-        raise ToolError("skus must be a non-empty list of strings")
+        raise ToolError("give skus (a non-empty list of strings) or a group_id")
     if len(set(skus)) > MAX_SKUS:
         raise ToolError(f"at most {MAX_SKUS} skus per call; narrow the scope")
     return sorted(set(skus))
@@ -97,9 +105,33 @@ def _regions(ctx: ToolContext, cands: list[dict], requested) -> list[str]:
     return sorted(set(requested))
 
 
-def _run(ctx: ToolContext, requested: str | None) -> str | None:
-    """The run to diagnose: the one the service pinned, else what the model asked for, else None."""
-    return ctx.run_id or requested
+def _scope(ctx: ToolContext, week: str, skus, group_id, requested_regions, cands: list[dict]) -> tuple[list[str], list[str]]:
+    """The skus and regions a call is about: an explicit list, or a group resolved earlier in the session."""
+    if group_id is not None and skus is not None:
+        raise ToolError("give skus or group_id, not both")
+    if group_id is not None:
+        if ctx.state is None:
+            raise ToolError("there are no session groups here; pass skus instead of group_id")
+        group = ctx.state.get_group(group_id)
+        if group is None:
+            raise ToolError(f"unknown group {group_id!r}; call resolve_products first")
+        if group["week"] != week:
+            raise ToolError(f"group {group_id} was resolved for {group['week']}, not {week}")
+        skus = group["skus"]
+        if requested_regions is None:
+            requested_regions = group["regions"]
+    return _skus(skus), _regions(ctx, cands, requested_regions)
+
+
+def _run(ctx: ToolContext, requested: str | None, week: str) -> tuple[str | None, str | None]:
+    """(run_id, data_version) to diagnose: the run the service pinned, else the newest finished run of the week,
+    else what the model asked for (a warehouse with no pipeline state)."""
+    latest = ctx.runs.latest(week) if ctx.runs else None
+    if ctx.run_id:
+        return ctx.run_id, latest["data_version"] if latest and latest["run_id"] == ctx.run_id else ctx.run_id
+    if latest:
+        return latest["run_id"], latest["data_version"]
+    return requested, requested
 
 
 def _patterns(records: list[dict], keys: list[str]) -> list[dict]:
@@ -133,31 +165,42 @@ def resolve_products(ctx: ToolContext, week: str, brand: str | None = None, cate
     if name_contains:
         rows = [c for c in rows if name_contains.lower() in c["name"].lower()]
     skus = sorted({c["sku"] for c in rows})
-    return {"as_of": _as_of(), "week": week, "regions": regions, "count": len(skus),
-            "skus": skus[:MAX_SKUS], "truncated": len(skus) > MAX_SKUS,
-            "sample": [{"sku": c["sku"], "name": c["name"], "brand": c["brand"], "category": c["category"]}
-                       for c in {r["sku"]: r for r in rows}.values()][:SAMPLE]}
+    result = {"as_of": _as_of(), "week": week, "regions": regions, "count": len(skus),
+              "skus": skus[:MAX_SKUS], "truncated": len(skus) > MAX_SKUS,
+              "sample": [{"sku": c["sku"], "name": c["name"], "brand": c["brand"], "category": c["category"]}
+                         for c in {r["sku"]: r for r in rows}.values()][:SAMPLE]}
+    if ctx.state is not None:
+        ctx.state.set_scope(week=week, brand=brand, category=category, name_contains=name_contains,
+                            regions="/".join(regions))
+        if skus:
+            label = ", ".join(f"{k} {v}" for k, v in (("brand", brand), ("category", category),
+                                                      ("name containing", name_contains)) if v) or "all products"
+            result["group_id"] = ctx.state.add_group(skus, label, week, regions, result["as_of"], _run(ctx, None, week)[1])
+    return result
 
 
-def diagnose_batch(ctx: ToolContext, week: str, skus: list[str], regions: list[str] | None = None,
-                   run_id: str | None = None) -> dict:
-    week, skus = _week(week), _skus(skus)
+def diagnose_batch(ctx: ToolContext, week: str, skus: list[str] | None = None, regions: list[str] | None = None,
+                   run_id: str | None = None, group_id: str | None = None) -> dict:
+    week = _week(week)
     cands = ctx.wh.get_candidates(week)
-    regions = _regions(ctx, cands, regions)
-    recs = ctx.wh.get_recommendations(week, _run(ctx, run_id))
+    skus, regions = _scope(ctx, week, skus, group_id, regions, cands)
+    run, version = _run(ctx, run_id, week)
+    recs = ctx.wh.get_recommendations(week, run)
     conditions = _sap_get(ctx, "/pricing/conditions", week=week)["items"]
     res = diagnose(skus, regions, cands, recs, ctx.wh.get_rules(week), conditions)
-    return {"as_of": _as_of(), "week": week, "run_id": recs[0]["run_id"] if recs else None,
+    return {"as_of": _as_of(), "week": week, "run_id": recs[0]["run_id"] if recs else None, "data_version": version,
             "skus_checked": len(skus), "regions": regions,
+            "records_per_region": dict(Counter(x["region"] for x in res)),
             "totals": dict(Counter(x["code"] for x in res)),
             "by_region": {r: dict(Counter(x["code"] for x in res if x["region"] == r)) for r in regions},
             "patterns": _patterns([x for x in res if x["code"] != "OK"], ["region", "code", "reason"])}
 
 
-def get_sap_conditions(ctx: ToolContext, week: str, skus: list[str], regions: list[str] | None = None) -> dict:
+def get_sap_conditions(ctx: ToolContext, week: str, skus: list[str] | None = None, regions: list[str] | None = None,
+                       group_id: str | None = None) -> dict:
     """Live read of the prices SAP holds. Lists only items whose effective price is not our markdown."""
-    week, skus = _week(week), _skus(skus)
-    regions = _regions(ctx, ctx.wh.get_candidates(week), regions)
+    week = _week(week)
+    skus, regions = _scope(ctx, week, skus, group_id, regions, ctx.wh.get_candidates(week))
     wanted = set(skus)
     items = [c for c in _sap_get(ctx, "/pricing/conditions", week=week)["items"]
              if c["sku"] in wanted and c["region"] in regions]
@@ -166,19 +209,18 @@ def get_sap_conditions(ctx: ToolContext, week: str, skus: list[str], regions: li
             "by_effective_source": dict(Counter(f"{c['region']}:{c['effective_source']}" for c in items)),
             "overridden": [{"sku": c["sku"], "pack_qty": c["pack_qty"], "region": c["region"],
                             "clearance_price_sent": c["price"], "effective_price": c["effective_price"],
-                            "effective_source": c["effective_source"],
-                            "markdown_valid_from": c["valid_from"], "markdown_valid_to": c["valid_to"]}
+                            "effective_source": c["effective_source"]}
                            for c in overridden[:MAX_ITEMS]],
             "overridden_truncated": len(overridden) > MAX_ITEMS,
             "fields": CONDITION_FIELDS}
 
 
-def get_api_log(ctx: ToolContext, week: str, skus: list[str], regions: list[str] | None = None,
-                run_id: str | None = None) -> dict:
+def get_api_log(ctx: ToolContext, week: str, skus: list[str] | None = None, regions: list[str] | None = None,
+                run_id: str | None = None, group_id: str | None = None) -> dict:
     """What SAP answered for each record (latest answer per record), problems only, as patterns."""
-    week, skus = _week(week), _skus(skus)
-    regions = _regions(ctx, ctx.wh.get_candidates(week), regions)
-    run_id = _run(ctx, run_id)
+    week = _week(week)
+    skus, regions = _scope(ctx, week, skus, group_id, regions, ctx.wh.get_candidates(week))
+    run_id = _run(ctx, run_id, week)[0]
     params = {"week": week} | ({"run_id": run_id} if run_id else {})
     wanted = set(skus)
     latest: dict[tuple, dict] = {}
@@ -190,18 +232,18 @@ def get_api_log(ctx: ToolContext, week: str, skus: list[str], regions: list[str]
             "patterns": _patterns(problems, ["region", "status", "code", "message"])}
 
 
-def check_rules(ctx: ToolContext, week: str, skus: list[str], regions: list[str] | None = None,
-                run_id: str | None = None) -> dict:
+def check_rules(ctx: ToolContext, week: str, skus: list[str] | None = None, regions: list[str] | None = None,
+                run_id: str | None = None, group_id: str | None = None) -> dict:
     """Re-run the hard price rules (floor, max markdown, ladder, ...) on the engine's recommended prices."""
-    week, skus = _week(week), _skus(skus)
-    cands = ctx.wh.get_candidates(week)
-    regions = _regions(ctx, cands, regions)
-    recs = ctx.wh.get_recommendations(week, _run(ctx, run_id))
+    week = _week(week)
+    skus, regions = _scope(ctx, week, skus, group_id, regions, ctx.wh.get_candidates(week))
+    run, version = _run(ctx, run_id, week)
+    recs = ctx.wh.get_recommendations(week, run)
     rules = {(r["sku"], r["pack_qty"]): r for r in ctx.wh.get_rules(week)}
     wanted = set(skus)
     found = [v for v in validate_rows(recs, rules)                      # whole week: ladder needs the Single
              if v["sku"] in wanted and v["region"] in regions]
-    return {"as_of": _as_of(), "week": week, "run_id": recs[0]["run_id"] if recs else None,
+    return {"as_of": _as_of(), "week": week, "run_id": recs[0]["run_id"] if recs else None, "data_version": version,
             "priced_checked": sum(r["status"] == "PRICED" and r["sku"] in wanted and r["region"] in regions
                                   for r in recs),
             "violations": len(found), "patterns": _patterns(found, ["region", "code"])}
@@ -220,6 +262,7 @@ _WEEK = {"type": "string", "description": "ISO week id such as 2026-W39"}
 _SKUS = {"type": "array", "items": {"type": "string"}, "description": f"sku ids, at most {MAX_SKUS}"}
 _REGIONS = {"type": "array", "items": {"type": "string"}, "description": "regions to include; default all"}
 _RUN = {"type": "string", "description": "pipeline run id; leave unset unless the user names a run"}
+_GROUP = {"type": "string", "description": "a group handle such as G1 from resolve_products; use it instead of skus"}
 
 
 def _schema(name: str, description: str, props: dict, required: list[str]) -> dict:
@@ -228,20 +271,22 @@ def _schema(name: str, description: str, props: dict, required: list[str]) -> di
 
 
 TOOL_SCHEMAS = [
-    _schema("resolve_products", "Find the skus on this week's clearance list matching a brand, category or name.",
+    _schema("resolve_products", "Find the skus on this week's clearance list matching a brand, category or name. "
+            "When the session keeps state it also returns a group_id handle for the skus; pass that to the other tools.",
             {"week": _WEEK, "brand": {"type": "string"}, "category": {"type": "string"},
              "name_contains": {"type": "string"}, "regions": _REGIONS}, ["week"]),
     _schema("diagnose_batch", "Deterministic verdict for every sku x region: OK, NOT_IN_LIST, MISSING_PRICE, "
             "RULE_VIOLATION, API_REJECTED, NOT_EFFECTIVE, ... Returns counts and patterns, not per-sku rows.",
-            {"week": _WEEK, "skus": _SKUS, "regions": _REGIONS, "run_id": _RUN}, ["week", "skus"]),
+            {"week": _WEEK, "skus": _SKUS, "group_id": _GROUP, "regions": _REGIONS, "run_id": _RUN}, ["week"]),
     _schema("get_sap_conditions", "Live read of the prices SAP holds; lists items whose effective price is "
             "overridden (e.g. by a promotion), with our clearance price sent and the effective price. It has no "
-            "promotion dates or priorities.", {"week": _WEEK, "skus": _SKUS, "regions": _REGIONS}, ["week", "skus"]),
+            "dates, priorities or names for promotions.", {"week": _WEEK, "skus": _SKUS, "group_id": _GROUP, "regions": _REGIONS},
+            ["week"]),
     _schema("get_api_log", "What SAP answered for each submitted record; problems only, grouped by code and message.",
-            {"week": _WEEK, "skus": _SKUS, "regions": _REGIONS, "run_id": _RUN}, ["week", "skus"]),
+            {"week": _WEEK, "skus": _SKUS, "group_id": _GROUP, "regions": _REGIONS, "run_id": _RUN}, ["week"]),
     _schema("check_rules", "Re-check the hard price rules (floor, max markdown, ladder, max weeks) on the "
             "recommended prices. Use it for any 'would this break a rule' question.",
-            {"week": _WEEK, "skus": _SKUS, "regions": _REGIONS, "run_id": _RUN}, ["week", "skus"]),
+            {"week": _WEEK, "skus": _SKUS, "group_id": _GROUP, "regions": _REGIONS, "run_id": _RUN}, ["week"]),
     _schema("search_docs", "Search playbooks and incident notes for why something happens and who owns it.",
             {"query": {"type": "string"}}, ["query"]),
 ]

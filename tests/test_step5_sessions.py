@@ -1,5 +1,6 @@
-"""Step 5, slice 3a: sessions and the HTTP API. Needs the Postgres container (docker compose up -d postgres);
-uses a throwaway schema `diagnostic_test`. The LLM is scripted and SAP is the fake from tests/conftest.py.
+"""Step 5, slices 3a and 3b: sessions and the HTTP API, with session state and history compaction.
+Needs the Postgres container (docker compose up -d postgres); uses a throwaway schema `diagnostic_test`.
+The LLM is scripted and SAP is the fake from tests/conftest.py.
 """
 import json
 import os
@@ -14,7 +15,8 @@ os.environ["DIAGNOSTIC_SCHEMA"] = "diagnostic_test"
 from jobs.data_gen.generate import WEEK
 from services.diagnostic_api.app import create_app, regions_for
 from services.diagnostic_api.llm import ScriptedLLM, text, tool_use
-from services.diagnostic_api.sessions import NotFound, SessionStore, TurnInProgress, VersionConflict, transcript_pairs
+from services.diagnostic_api.sessions import NotFound, SessionStore, TurnInProgress, VersionConflict
+from services.diagnostic_api.state import MAX_TURNS
 from shared import db
 
 try:
@@ -34,18 +36,6 @@ def test_regions_for_reads_the_user_map():
     assert regions_for("both", raw) == frozenset({"NSW", "VIC"})
     assert regions_for("someone-else", raw) is None                     # not listed: every region
     assert regions_for("anyone", "") is None
-
-
-def test_transcript_pairs_keep_only_questions_and_final_answers():
-    history = [{"role": "user", "content": "q1"},
-               {"role": "assistant", "content": [text("checking"), tool_use("check_rules", {}, "t1")]},
-               {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "{}"}]},
-               {"role": "assistant", "content": [text("all clear")]},
-               {"role": "user", "content": "q2"},
-               {"role": "assistant", "content": [text("second answer")]}]
-    assert transcript_pairs(history) == [{"question": "q1", "answer": "all clear"},
-                                         {"question": "q2", "answer": "second answer"}]
-    assert transcript_pairs([]) == []
 
 
 # ======================= the HTTP API =======================
@@ -70,7 +60,11 @@ def api(env, monkeypatch):
         rig.ctx_calls.append((user, regions))
         return env["ctx"]
 
-    with TestClient(create_app(store, llm_factory, ctx_factory)) as client:
+    class FakeRuns:                                     # the pipeline's run table is tested in test_step5_state
+        def latest(self, week):
+            return {"run_id": env["run"], "status": "SUCCEEDED", "finished_at": None, "data_version": f"{env['run']}@t0"}
+
+    with TestClient(create_app(store, llm_factory, ctx_factory, runs=FakeRuns())) as client:
         rig.client, rig.env = client, env
         yield rig
 
@@ -110,16 +104,17 @@ def test_create_ask_and_read_back(api):
 
 
 @pg
-def test_a_turn_uses_tools_and_the_second_turn_sees_the_first(api):
+def test_a_turn_uses_tools_and_the_second_turn_sees_the_first_compacted(api):
     sid = start(api)
     api.steps = [[tool_use("check_rules", {"week": WEEK, "skus": api.env["skus"]})], [text("no violations")]]
     first = ask(api, sid, "any rule problems?").json()
     assert first["answer"] == "no violations" and [c["tool"] for c in first["tool_calls"]] == ["check_rules"]
     api.steps = [[text("still none")]]
     assert ask(api, sid, "and now?").json()["turn"] == 2
-    seen = api.llms[-1].calls[0]["messages"]
-    assert [m["role"] for m in seen] == ["user", "assistant", "user", "assistant", "user"]   # turn 1 in full, then turn 2
+    seen = api.llms[-1].calls[0]["messages"]                                      # turn 1 arrives compacted: question + answer
+    assert [m["role"] for m in seen] == ["user", "assistant", "user"]
     assert seen[0]["content"] == "any rule problems?" and seen[-1]["content"] == "and now?"
+    assert seen[1]["content"] == [{"type": "text", "text": "no violations"}]
 
 
 @pg
@@ -262,3 +257,65 @@ def test_store_get_reports_not_found_for_the_wrong_owner(api):
     sid = start(api)
     with pytest.raises(NotFound):
         api.store.get(sid, "bob")
+
+
+# ======================= 3b: session state and compaction through the API =======================
+def first_brand(api):
+    return next(c["brand"] for c in api.env["wh"].get_candidates(WEEK) if c["name"] is not None)
+
+
+@pg
+def test_groups_persist_in_the_session_and_later_turns_use_them(api):
+    sid = start(api)
+    api.steps = [[tool_use("resolve_products", {"week": WEEK, "brand": first_brand(api)})], [text("resolved")]]
+    ask(api, sid, "which products are that brand?")
+    assert "Session state" not in api.llms[-1].calls[0]["system"]                 # nothing to show on the first turn
+    state = rows("SELECT state FROM diagnostic_test.sessions WHERE session_id = %s", (sid,))[0]["state"]
+    assert list(state["groups"]) == ["G1"] and state["next_group"] == 2 and state["scope"]["brand"] == first_brand(api)
+    shown = api.client.get(f"/sessions/{sid}", headers=ALICE).json()["groups"]
+    assert shown["G1"]["skus"] == len(state["groups"]["G1"]["skus"]) and "regions" in shown["G1"]
+
+    api.steps = [[tool_use("diagnose_batch", {"week": WEEK, "group_id": "G1"})], [text("diagnosed")]]
+    second = ask(api, sid, "and how are they doing?").json()
+    assert second["tool_calls"][0]["is_error"] is False
+    system = api.llms[-1].calls[0]["system"]
+    assert "G1:" in system and "pass group_id" in system                          # the model is told the handle exists
+    t = rows("SELECT messages FROM diagnostic_test.turn_transcripts WHERE session_id = %s AND turn_no = 2", (sid,))[0]
+    result = json.loads(t["messages"][2]["content"][0]["content"])                # turn 2: question, tool_use, tool_result, ...
+    assert result["run_id"] == api.env["run"] and result["data_version"] == f"{api.env['run']}@t0"
+
+
+@pg
+def test_a_group_belongs_to_its_session(api):
+    a, b = start(api), start(api)
+    api.steps = [[tool_use("resolve_products", {"week": WEEK})], [text("ok")]]
+    ask(api, a)
+    api.steps = [[tool_use("diagnose_batch", {"week": WEEK, "group_id": "G1"})], [text("cannot")]]
+    assert ask(api, b).json()["tool_calls"][0]["is_error"] is True               # session b never resolved G1
+
+
+@pg
+def test_history_stays_bounded_and_old_questions_survive_only_as_questions(api):
+    sid = start(api)
+    for i in range(1, 14):
+        api.steps = [[text(f"a{i}")]]
+        assert ask(api, sid, f"q{i}").status_code == 200
+    row = rows("SELECT state, history FROM diagnostic_test.sessions WHERE session_id = %s", (sid,))[0]
+    assert row["state"]["earlier_questions"] == ["q1", "q2"]
+    assert len(row["history"]) == 2 * (MAX_TURNS + 1)                             # 10 earlier turns + the latest
+    last_call = api.llms[-1].calls[0]
+    assert len(last_call["messages"]) == 2 * MAX_TURNS + 1 and "q1 | q2" in last_call["system"]
+    conversation = api.client.get(f"/sessions/{sid}", headers=ALICE).json()["conversation"]
+    assert [c["question"] for c in conversation] == [f"q{i}" for i in range(1, 14)]   # the audit log keeps every turn
+
+
+@pg
+def test_a_failed_turn_keeps_no_new_state(api):
+    sid = start(api)
+
+    def boom(messages):
+        raise RuntimeError("model down")
+    api.steps = [[tool_use("resolve_products", {"week": WEEK})], boom]           # a group is created, then the model fails
+    assert ask(api, sid).status_code == 502
+    row = rows("SELECT state, history, version FROM diagnostic_test.sessions WHERE session_id = %s", (sid,))[0]
+    assert row["state"] == {} and row["history"] == [] and row["version"] == 0
