@@ -22,6 +22,8 @@ class Config:
     sap_write_key: str
     anthropic_model: str = "claude-haiku-4-5"     # the API key itself is read by the SDK from ANTHROPIC_API_KEY
     default_week: str = ""                        # what "this week" means to the assistant
+    session_idle_minutes: int = 120               # a session expires after this long without a message
+    user_regions: str = ""                        # JSON {"user": ["REGION", ...]}; users not listed see every region
 
 
 def load_config() -> Config:
@@ -38,4 +40,6 @@ def load_config() -> Config:
         sap_write_key=e("SAP_WRITE_KEY", "dev-write-key"),
         anthropic_model=e("ANTHROPIC_MODEL", "claude-haiku-4-5"),
         default_week=e("DEFAULT_WEEK") or current_week(),
+        session_idle_minutes=int(e("SESSION_IDLE_MINUTES", "120")),
+        user_regions=e("USER_REGIONS", ""),
     )
