@@ -5,6 +5,7 @@ diagnostic tools never build SQL and both backends can be tested with the same f
 """
 from __future__ import annotations
 
+import time
 from abc import ABC, abstractmethod
 
 import duckdb
@@ -31,14 +32,28 @@ class WarehouseClient(ABC):
     @abstractmethod
     def get_inventory(self, skus: list[str], week: str) -> list[dict]: ...
 
+    @abstractmethod
+    def get_recommendations(self, week: str, run_id: str | None = None) -> list[dict]:
+        """Engine output for a week (price_recommendations). run_id None = the latest run of that week."""
+
 
 class DuckDBWarehouse(WarehouseClient):
+    LOCK_RETRIES, LOCK_WAIT = 5, 0.2
+
     def __init__(self, path: str, read_only: bool = True):
         self.path, self.read_only = path, read_only
 
     def _rows(self, sql: str, params: list | None = None) -> list[dict]:
-        # Short-lived connection per call (DuckDB allows one writer process).
-        con = duckdb.connect(self.path, read_only=self.read_only)
+        # Short-lived connection per call (DuckDB allows one writer process). A reader that hits
+        # the pipeline's write lock waits briefly and retries.
+        for attempt in range(self.LOCK_RETRIES):
+            try:
+                con = duckdb.connect(self.path, read_only=self.read_only)
+                break
+            except duckdb.IOException:
+                if attempt == self.LOCK_RETRIES - 1:
+                    raise
+                time.sleep(self.LOCK_WAIT)
         try:
             cur = con.execute(sql, params or [])
             cols = [c[0] for c in cur.description]
@@ -97,6 +112,15 @@ class DuckDBWarehouse(WarehouseClient):
             f" ORDER BY sku, pack_qty, region",
             [week, *skus])
 
+    def get_recommendations(self, week, run_id=None):
+        try:
+            return self._rows(
+                "SELECT * FROM price_recommendations WHERE week = ? AND run_id = COALESCE(?,"
+                " (SELECT max(run_id) FROM price_recommendations WHERE week = ?))"
+                " ORDER BY sku, pack_qty, region", [week, run_id, week])
+        except duckdb.CatalogException:                    # no pipeline run has written the table yet
+            return []
+
 
 class BigQueryWarehouse(WarehouseClient):
     """Placeholder: implement with parameterised google-cloud-bigquery queries at deploy time.
@@ -109,7 +133,7 @@ class BigQueryWarehouse(WarehouseClient):
         raise NotImplementedError("BigQueryWarehouse is implemented in the GCP deployment step")
 
     get_candidates = get_rules = get_sales_history = get_inventory = _todo
-    get_price_history = get_products = _todo
+    get_price_history = get_products = get_recommendations = _todo
 
 
 def get_warehouse(cfg: Config | None = None, read_only: bool = True) -> WarehouseClient:

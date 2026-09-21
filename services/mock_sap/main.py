@@ -3,6 +3,7 @@
     GET  /clearance/candidates?week=   weekly clearance list + business rules  (read or write key)
     POST /pricing/markdown-prices      receive recommended prices, per-record result (write key)
     GET  /pricing/conditions?week=     prices SAP currently holds                (read or write key)
+    GET  /pricing/submissions?week=    log of every record SAP received          (read or write key)
     GET  /healthz
 
 Fault injection on POST /pricing/markdown-prices (env vars, read on every request):
@@ -239,4 +240,19 @@ def conditions(week: str = Query(..., pattern=r"^\d{4}-W\d{2}$")):
             LEFT JOIN {s}.promotions p
                    ON p.week = c.week AND p.sku = c.sku AND p.pack_qty = c.pack_qty AND p.region = c.region
             WHERE c.week = %s ORDER BY c.sku, c.pack_qty, c.region""", (week,)).fetchall()
+    return {"week": week, "count": len(rows), "items": rows}
+
+
+# ---------------- GET submissions (the API log, read-only) ----------------
+@app.get("/pricing/submissions", dependencies=[Depends(require_read)])
+def submissions(week: str = Query(..., pattern=r"^\d{4}-W\d{2}$"), run_id: str | None = None,
+                status: str | None = None, limit: int = Query(20000, ge=1, le=20000)):
+    """Append-only log of what SAP received and answered, oldest first (a replay adds a new row)."""
+    s = schema()
+    with db.connect() as con:
+        rows = con.execute(f"""
+            SELECT id, received_at, run_id, week, sku, pack_qty, region, status, code, message, duplicate
+            FROM {s}.submission_log
+            WHERE week = %s AND (%s::text IS NULL OR run_id = %s) AND (%s::text IS NULL OR status = %s)
+            ORDER BY id LIMIT %s""", (week, run_id, run_id, status, status, limit)).fetchall()
     return {"week": week, "count": len(rows), "items": rows}
