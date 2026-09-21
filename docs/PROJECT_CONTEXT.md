@@ -14,7 +14,7 @@ assistant that the author worked on at a retailer.
 Hard constraints:
 
 - **Synthetic data only.** No employer code, data, schemas, internal documents or playbooks.
-  Playbooks and incident notes in `docs/playbooks/` are written from scratch.
+  Playbooks and incident notes in `playbooks/` (tracked; `docs/` is gitignored) are written from scratch.
 - **Generic naming.** Use fictional brands (e.g. "Brand A", "Harbour Ridge", "Stonefield"),
   not real product or employer names. The reference code in section 14 uses real wine brands
   as placeholders; rename them when porting.
@@ -390,7 +390,7 @@ Local runs read `.env` (the server and chat CLI load it themselves; real environ
 │   └── rag_ingest/
 ├── docs/
 │   ├── PROJECT_CONTEXT.md  # this file
-│   └── playbooks/          # synthetic playbooks and incident notes (RAG corpus)
+│   └── (playbooks moved out: docs/ is gitignored)
 └── infra/
     ├── iam.sh
     └── deploy.sh
@@ -403,7 +403,7 @@ Each service/job has its own Dockerfile and requirements; build context is the r
 
 ## 9. Build order (each step must run end to end before moving on)
 
-**Status: steps 1-5 done and tested; steps 6-9 not started.** Step 5 as built: section 17.
+**Status: steps 1-5 done and tested; step 6 in progress (corpus + loader done, ingest job / `search_docs` next); steps 7-9 not started.** Step 5 as built: section 17.
 
 1. **Synthetic data** → DuckDB: SKUs (fictional brands), stores/regions, sales, inventory,
    weekly candidate list, business rules. Seeded so scenarios are reproducible.
@@ -415,7 +415,11 @@ Each service/job has its own Dockerfile and requirements; build context is the r
 4. **weekly-pipeline job** chaining 1–3.
 5. **diagnostic-api:** DONE (rebuilt from sections 3-5, not ported: the reference files in
    section 14 were never in the repo). Session, memory, cache, findings: section 17.
-6. **rag-ingest + playbooks** into pgvector; implement `search_docs`.
+6. **rag-ingest + playbooks** into pgvector; implement `search_docs`. Plan: pgvector in the existing
+   Postgres (schema `knowledge`); corpus in the tracked `playbooks/` folder (27 documents: playbooks, incidents,
+   policies, reference; README explains format and tags); tag-first lookup by `CODE:reason`, similarity search as
+   fallback with a relevance threshold; a test keeps every emittable code covered by a playbook. Done so far:
+   corpus + `jobs/rag_ingest/corpus.py` loader and `tests/test_step6_corpus.py`.
 7. **ui:** Streamlit chat; expandable panel showing tool calls per answer.
 8. **infra:** IAM script and deploy script for GCP.
 9. Optional: deploy to Cloud Run with a budget alert.
