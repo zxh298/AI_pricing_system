@@ -10,3 +10,4 @@ httpx
 psycopg[binary]
 anthropic
 fastembed
+streamlit

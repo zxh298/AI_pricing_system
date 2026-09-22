@@ -30,6 +30,7 @@ class Config:
     embedding_cache_dir: str = ""                 # where the model is stored; default ~/.cache/ai_pricing_fastembed
     search_min_score: float = 0.67                # documents less similar than this are not returned by similarity search
                                                    # (set from evals/retrieval.py: separates on-topic from off-topic at 0.67)
+    diagnostic_api_url: str = "http://localhost:8000"   # where the ui reaches diagnostic-api
 
 
 def load_config() -> Config:
@@ -53,4 +54,5 @@ def load_config() -> Config:
         embedding_model=e("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5"),
         embedding_cache_dir=e("EMBEDDING_CACHE_DIR", ""),
         search_min_score=float(e("SEARCH_MIN_SCORE", "0.67")),
+        diagnostic_api_url=e("DIAGNOSTIC_API_URL", "http://localhost:8000"),
     )

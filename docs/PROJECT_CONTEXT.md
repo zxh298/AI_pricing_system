@@ -446,7 +446,21 @@ Each service/job has its own Dockerfile and requirements; build context is the r
    separating on-topic-by-similarity from off-topic questions; the highest off-topic score is 0.66, the lowest
    on-topic 0.66): 0% off-topic false positives, 97% on-topic "found". Full report: evals/RESULTS.md
    (`python -m evals.retrieval --write` to regenerate).
-7. **ui:** Streamlit chat; expandable panel showing tool calls per answer.
+7. **ui:** DONE. Streamlit chat (`services/ui/app.py`, `services/ui/client.py`) against diagnostic-api
+   only (no DuckDB/Postgres/SAP access, no LLM call of its own): sidebar identity (X-User, role) and session
+   controls, a Chat tab (conversation from GET /sessions/{id}, an expandable tool-calls panel, escalated /
+   truncated warnings), and a Findings tab (list + filters; write form and resolve buttons only for role
+   analyst, matching the API's own enforcement). `streamlit run services/ui/app.py` (reads .env for
+   DIAGNOSTIC_API_URL). Verified live: real session, a real Claude answer with playbook citations, role
+   switch, Findings tab, screenshotted -- no console errors. Two real bugs found only by actually running it
+   in a browser (not by the 34 AppTest-headless tests): (1) `streamlit run` only puts the script's own
+   directory on sys.path, unlike `python -m`, so the `services.*` imports failed outright -- fixed with an
+   explicit sys.path insert of the project root at the top of app.py; (2) `st.rerun()` called right after
+   `st.error`/`st.success` wiped the message before a user could ever see it, on both the chat-error path and
+   the finding-recorded path -- fixed with try/except/else (skip the rerun on error) and a session-state
+   "flash" message that survives exactly one rerun. Tests: tests/test_step7_ui_client.py (11, a fake httpx
+   transport) and tests/test_step7_ui_app.py (23, Streamlit's headless AppTest with a monkeypatched
+   FakeApiClient; st.cache_resource is process-wide and must be cleared between tests).
 8. **infra:** IAM script and deploy script for GCP.
 9. Optional: deploy to Cloud Run with a budget alert.
 
