@@ -337,11 +337,20 @@ independent releases; failure isolation (diagnostics down must not affect pricin
 | Container | Role |
 |---|---|
 | `postgres` | sessions, findings, rules snapshot, RAG vectors |
-| `ui` :8501 | calls `http://diagnostic-api:8000` |
-| `diagnostic-api` :8000 | reads DuckDB (read-only), reads/writes Postgres, GETs mock-sap, calls LLM |
+| `ui` :8501 | DONE. calls `http://diagnostic-api:8000` only; no DuckDB/Postgres/SAP access, no key of its own |
+| `diagnostic-api` :8000 | DONE. reads DuckDB read-only (`./data:/data:ro`), reads/writes Postgres, GETs mock-sap with SAP_READ_KEY only (never SAP_WRITE_KEY), calls the LLM |
 | `mock-sap` :8001 | own condition-record state; fault rates set by env vars |
 | `weekly-pipeline` | compose profile `jobs`; `docker compose run --rm weekly-pipeline` |
-| `rag-ingest` | compose profile `jobs` |
+| `rag-ingest` | not containerized yet; run `python -m jobs.rag_ingest` locally (needs Postgres reachable) |
+
+`docker compose up -d postgres mock-sap diagnostic-api ui` brings up the full user-facing stack. Both
+Dockerfiles follow the mock-sap/weekly-pipeline pattern (`services/diagnostic_api/Dockerfile`,
+`services/ui/Dockerfile`; each with its own `requirements.txt`); diagnostic-api's copies only the two pure
+functions it needs from `jobs/weekly_pipeline` (`reconcile.py`, `validate.py`), not the whole job. Verified
+live: built, brought up together, driven through a real headless browser -- a real Claude answer, correct
+service-name resolution over the compose network (`http://diagnostic-api:8000`, not localhost), no console
+errors. IAM (`infra/iam.sh`) and deploy (`infra/deploy.sh`) scripts, and containerizing rag-ingest, remain
+open (step 8, not started).
 
 **DuckDB caveat:** a single process may open the file for writing. diagnostic-api should open
 short read-only connections per request and retry if the pipeline holds the write lock.

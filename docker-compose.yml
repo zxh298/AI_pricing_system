@@ -33,6 +33,36 @@ services:
     depends_on:
       postgres: {condition: service_healthy}
 
+  diagnostic-api:
+    build:
+      context: .
+      dockerfile: services/diagnostic_api/Dockerfile
+    environment:
+      PORT: "8000"
+      DATABASE_URL: postgresql://pricing:pricing@postgres:5432/pricing
+      SAP_BASE_URL: http://mock-sap:8001
+      SAP_READ_KEY: ${SAP_READ_KEY:-dev-read-key}   # never SAP_WRITE_KEY: this service cannot change a price
+      DUCKDB_PATH: /data/warehouse.duckdb
+      LLM_PROVIDER: ${LLM_PROVIDER:-scripted}       # scripted needs no key; anthropic needs ANTHROPIC_API_KEY below
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-haiku-4-5}
+    ports: ["8000:8000"]
+    volumes: ["./data:/data:ro"]                    # read-only: the warehouse is written only by weekly-pipeline
+    depends_on:
+      postgres: {condition: service_healthy}
+      mock-sap: {condition: service_started}
+
+  ui:
+    build:
+      context: .
+      dockerfile: services/ui/Dockerfile
+    environment:
+      PORT: "8501"
+      DIAGNOSTIC_API_URL: http://diagnostic-api:8000
+    ports: ["8501:8501"]
+    depends_on:
+      diagnostic-api: {condition: service_started}
+
   # Batch job: docker compose run --rm weekly-pipeline --week 2026-W39
   weekly-pipeline:
     profiles: [jobs]
