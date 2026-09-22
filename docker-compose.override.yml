@@ -1,0 +1,8 @@
+# Dev-only (auto-loaded by `docker compose`): mount source and reload on change.
+# Not used when deploying to Cloud Run.
+services:
+  mock-sap:
+    command: ["sh", "-c", "uvicorn services.mock_sap.main:app --host 0.0.0.0 --port $${PORT} --reload"]
+    volumes:
+      - ./services/mock_sap:/app/services/mock_sap
+      - ./shared:/app/shared

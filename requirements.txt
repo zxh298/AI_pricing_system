@@ -1,0 +1,14 @@
+duckdb
+numpy
+pandas
+pytest
+ipykernel
+matplotlib
+fastapi
+pydantic
+uvicorn
+httpx
+psycopg[binary]
+anthropic
+fastembed
+streamlit

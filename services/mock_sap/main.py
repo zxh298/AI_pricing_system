@@ -1,0 +1,258 @@
+"""mock-sap: stands in for the external SAP system of record.
+
+    GET  /clearance/candidates?week=   weekly clearance list + business rules  (read or write key)
+    POST /pricing/markdown-prices      receive recommended prices, per-record result (write key)
+    GET  /pricing/conditions?week=     prices SAP currently holds                (read or write key)
+    GET  /pricing/submissions?week=    log of every record SAP received          (read or write key)
+    GET  /healthz
+
+Fault injection on POST /pricing/markdown-prices (env vars, read on every request):
+    SAP_FAULT_FAIL_FIRST_N=2    the first N POST requests answer 503
+    SAP_FAULT_429_RATE=0.3      fraction of POST requests answered 429 (Retry-After header)
+    SAP_FAULT_5XX_RATE=0.2      fraction of POST requests answered 503
+    SAP_FAULT_SEED=1            seed for the random faults
+    SAP_FAULT_RETRY_AFTER=1     seconds advertised in Retry-After
+Promotions (table promotions) override a markdown: SAP accepts the price, but the *effective*
+price in GET /pricing/conditions is the promotion price (accepted != effective).
+
+SAP-side validation is deliberately thin (format, article on list, validity overlap). Business
+rules (floor, markdown cap, ladder) are the pricing engine's job; reconciliation catches the rest.
+"""
+from __future__ import annotations
+
+import json
+import os
+import random
+from datetime import date
+from decimal import Decimal, InvalidOperation
+
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+
+from shared import db
+from shared.sap_schema import ddl, schema
+
+MAX_BATCH = int(os.environ.get("SAP_MAX_BATCH", "500"))
+
+app = FastAPI(title="mock-sap")
+
+
+@app.on_event("startup")
+def _init_schema() -> None:
+    with db.connect() as con:
+        con.execute(ddl())
+
+
+# ---------------- auth: read key for GET, write key for POST (write key also reads) ----------
+def _keys() -> tuple[str, str]:
+    return os.environ.get("SAP_READ_KEY", "dev-read-key"), os.environ.get("SAP_WRITE_KEY", "dev-write-key")
+
+
+def require_read(x_api_key: str | None = Header(default=None)) -> str:
+    read, write = _keys()
+    if x_api_key not in (read, write):
+        raise HTTPException(401, "invalid or missing API key")
+    return x_api_key
+
+
+def require_write(x_api_key: str | None = Header(default=None)) -> str:
+    _, write = _keys()
+    if x_api_key is None:
+        raise HTTPException(401, "invalid or missing API key")
+    if x_api_key != write:
+        raise HTTPException(403, "write key required")
+    return x_api_key
+
+
+# ---------------- fault injection (POST only) ----------------
+_post_calls = 0
+_rng = random.Random()
+_rng_seed = None
+
+
+def reset_faults() -> None:
+    """Restart the injected-fault counters (used by tests)."""
+    global _post_calls, _rng, _rng_seed
+    _post_calls, _rng_seed = 0, None
+    _rng = random.Random()
+
+
+def _maybe_inject_fault() -> None:
+    global _post_calls, _rng, _rng_seed
+    _post_calls += 1
+    if _post_calls <= int(os.environ.get("SAP_FAULT_FAIL_FIRST_N", "0")):
+        raise HTTPException(503, "injected fault: service unavailable")
+    r429 = float(os.environ.get("SAP_FAULT_429_RATE", "0"))
+    r5xx = float(os.environ.get("SAP_FAULT_5XX_RATE", "0"))
+    if r429 <= 0 and r5xx <= 0:
+        return
+    seed = os.environ.get("SAP_FAULT_SEED")
+    if seed != _rng_seed:
+        _rng, _rng_seed = random.Random(seed), seed
+    x = _rng.random()
+    if x < r429:
+        raise HTTPException(429, "injected fault: too many requests",
+                            headers={"Retry-After": os.environ.get("SAP_FAULT_RETRY_AFTER", "1")})
+    if x < r429 + r5xx:
+        raise HTTPException(503, "injected fault: service unavailable")
+
+
+@app.get("/healthz")
+def healthz():
+    with db.connect() as con:
+        con.execute("SELECT 1")
+    return {"status": "ok"}
+
+
+# ---------------- GET candidates + rules ----------------
+@app.get("/clearance/candidates", dependencies=[Depends(require_read)])
+def candidates(week: str = Query(..., pattern=r"^\d{4}-W\d{2}$")):
+    s = schema()
+    with db.connect() as con:
+        rows = con.execute(f"""
+            SELECT c.week, c.sku, c.pack_type, c.pack_qty, c.region,
+                   c.shelf_price::float AS shelf_price, c.week_no,
+                   c.current_price::float AS current_price,
+                   r.price_floor::float AS price_floor,
+                   r.max_markdown_pct::float AS max_markdown_pct,
+                   r.max_clearance_weeks, r.rule_version
+            FROM {s}.clearance_candidates c
+            LEFT JOIN {s}.business_rules r USING (week, sku, pack_qty)
+            WHERE c.week = %s ORDER BY c.sku, c.pack_qty, c.region""", (week,)).fetchall()
+    if not rows:
+        raise HTTPException(404, f"no clearance list for {week}")
+    return {"week": week, "count": len(rows), "items": rows}
+
+
+# ---------------- POST prices ----------------
+def _validate(rec: dict) -> tuple[dict | None, tuple[str, str] | None]:
+    """Format checks only. Returns (clean record, None) or (None, (code, message))."""
+    try:
+        sku = str(rec["sku"]).strip()
+        pack_qty = int(rec["pack_qty"])
+        region = str(rec["region"]).strip()
+        price = Decimal(str(rec["markdown_price"]))
+        valid_from = date.fromisoformat(str(rec["valid_from"]))
+        valid_to = date.fromisoformat(str(rec["valid_to"]))
+    except KeyError as e:
+        return None, ("BAD_FORMAT", f"missing field {e.args[0]}")
+    except (ValueError, TypeError, InvalidOperation):
+        return None, ("BAD_FORMAT", "unparseable field value")
+    if not sku or not region or pack_qty < 1:
+        return None, ("BAD_FORMAT", "sku, region and pack_qty must be set")
+    if price <= 0 or price != price.quantize(Decimal("0.01")):
+        return None, ("BAD_FORMAT", "markdown_price must be positive with at most 2 decimals")
+    if valid_from > valid_to:
+        return None, ("BAD_FORMAT", "valid_from is after valid_to")
+    return dict(sku=sku, pack_qty=pack_qty, region=region, price=price,
+                valid_from=valid_from, valid_to=valid_to), None
+
+
+@app.post("/pricing/markdown-prices", dependencies=[Depends(require_write)])
+async def post_prices(request: Request):
+    _maybe_inject_fault()
+    try:
+        body = await request.json()
+        run_id, week, prices = str(body["run_id"]), str(body["week"]), body["prices"]
+        assert isinstance(prices, list)
+    except Exception:
+        raise HTTPException(400, "body must be JSON with run_id, week and a prices list")
+    if len(prices) > MAX_BATCH:
+        raise HTTPException(413, f"batch too large (max {MAX_BATCH})")
+
+    s, results = schema(), []
+    with db.connect() as con:
+        for rec in prices:
+            clean, err = _validate(rec) if isinstance(rec, dict) else (None, ("BAD_FORMAT", "record is not an object"))
+            ident = {k: (rec.get(k) if isinstance(rec, dict) else None) for k in ("sku", "pack_qty", "region")}
+            if err:
+                results.append({**ident, "status": "REJECTED", "code": err[0], "message": err[1], "duplicate": False})
+                continue
+            c = clean
+            idem = f"{run_id}|{c['sku']}|{c['pack_qty']}|{c['region']}|{c['valid_from']}"
+            ident = {"sku": c["sku"], "pack_qty": c["pack_qty"], "region": c["region"]}
+
+            # idempotent replay: same key already accepted
+            prev = con.execute(f"SELECT price FROM {s}.price_conditions WHERE idem_key = %s", (idem,)).fetchone()
+            if prev:
+                if prev["price"] == c["price"]:
+                    results.append({**ident, "status": "ACCEPTED", "code": "OK", "message": "already accepted", "duplicate": True})
+                else:
+                    results.append({**ident, "status": "REJECTED", "code": "IDEMPOTENCY_CONFLICT",
+                                    "message": "same key was accepted with a different price", "duplicate": True})
+                continue
+            # article must be on SAP's own list for that week and region
+            on_list = con.execute(
+                f"SELECT 1 FROM {s}.clearance_candidates WHERE week=%s AND sku=%s AND pack_qty=%s AND region=%s",
+                (week, c["sku"], c["pack_qty"], c["region"])).fetchone()
+            if not on_list:
+                results.append({**ident, "status": "REJECTED", "code": "NOT_ON_LIST",
+                                "message": f"not on the {week} clearance list", "duplicate": False})
+                continue
+            # validity period must not overlap an existing condition record
+            clash = con.execute(
+                f"""SELECT run_id, valid_from, valid_to FROM {s}.price_conditions
+                    WHERE sku=%s AND pack_qty=%s AND region=%s AND valid_from <= %s AND valid_to >= %s""",
+                (c["sku"], c["pack_qty"], c["region"], c["valid_to"], c["valid_from"])).fetchone()
+            if clash:
+                results.append({**ident, "status": "REJECTED", "code": "VALIDITY_OVERLAP",
+                                "message": f"validity overlaps existing condition record (run {clash['run_id']}, "
+                                           f"{clash['valid_from']} to {clash['valid_to']})", "duplicate": False})
+                continue
+            con.execute(
+                f"""INSERT INTO {s}.price_conditions
+                    (idem_key, run_id, week, sku, pack_qty, region, price, valid_from, valid_to)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                (idem, run_id, week, c["sku"], c["pack_qty"], c["region"], c["price"], c["valid_from"], c["valid_to"]))
+            results.append({**ident, "status": "ACCEPTED", "code": "OK", "message": "accepted", "duplicate": False})
+
+        # append-only submission log: every received record, whatever its outcome
+        with con.cursor() as cur:
+            cur.executemany(
+                f"""INSERT INTO {s}.submission_log
+                    (run_id, week, sku, pack_qty, region, status, code, message, duplicate, payload)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                [(run_id, week, None if r["sku"] is None else str(r["sku"]),
+                  None if r["pack_qty"] is None else str(r["pack_qty"]), r["region"],
+                  r["status"], r["code"], r["message"], r["duplicate"], json.dumps(rec, default=str))
+                 for rec, r in zip(prices, results)])
+
+    accepted = sum(r["status"] == "ACCEPTED" for r in results)
+    return {"run_id": run_id, "week": week,
+            "summary": {"received": len(results), "accepted": accepted,
+                        "rejected": len(results) - accepted,
+                        "duplicates": sum(r["duplicate"] for r in results)},
+            "results": results}
+
+
+# ---------------- GET conditions ----------------
+@app.get("/pricing/conditions", dependencies=[Depends(require_read)])
+def conditions(week: str = Query(..., pattern=r"^\d{4}-W\d{2}$")):
+    """Prices SAP holds. `price` is what we sent; `effective_price` is what shoppers pay:
+    a promotion for the same item and region overrides the markdown."""
+    s = schema()
+    with db.connect() as con:
+        rows = con.execute(f"""
+            SELECT c.run_id, c.week, c.sku, c.pack_qty, c.region, c.price::float AS price,
+                   COALESCE(p.promo_price, c.price)::float AS effective_price,
+                   CASE WHEN p.promo_price IS NULL THEN 'MARKDOWN' ELSE 'PROMOTION' END AS effective_source,
+                   c.valid_from, c.valid_to
+            FROM {s}.price_conditions c
+            LEFT JOIN {s}.promotions p
+                   ON p.week = c.week AND p.sku = c.sku AND p.pack_qty = c.pack_qty AND p.region = c.region
+            WHERE c.week = %s ORDER BY c.sku, c.pack_qty, c.region""", (week,)).fetchall()
+    return {"week": week, "count": len(rows), "items": rows}
+
+
+# ---------------- GET submissions (the API log, read-only) ----------------
+@app.get("/pricing/submissions", dependencies=[Depends(require_read)])
+def submissions(week: str = Query(..., pattern=r"^\d{4}-W\d{2}$"), run_id: str | None = None,
+                status: str | None = None, limit: int = Query(20000, ge=1, le=20000)):
+    """Append-only log of what SAP received and answered, oldest first (a replay adds a new row)."""
+    s = schema()
+    with db.connect() as con:
+        rows = con.execute(f"""
+            SELECT id, received_at, run_id, week, sku, pack_qty, region, status, code, message, duplicate
+            FROM {s}.submission_log
+            WHERE week = %s AND (%s::text IS NULL OR run_id = %s) AND (%s::text IS NULL OR status = %s)
+            ORDER BY id LIMIT %s""", (week, run_id, run_id, status, status, limit)).fetchall()
+    return {"week": week, "count": len(rows), "items": rows}
