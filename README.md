@@ -13,19 +13,9 @@ No employer code, data or internal documents are used anywhere in this repositor
 
 ## Architecture
 
-```
-mock-sap (FastAPI)  <-- weekly clearance list, business rules, published prices, fault injection
-      |
-weekly-pipeline job:  ingest -> price -> validate -> send -> reconcile -> history
-      |                                                              |
-DuckDB (warehouse: sales, inventory, price history)          Postgres (run state, sessions,
-                                                               findings, tool cache, RAG vectors)
-      \                                                              /
-       \-------------------------  diagnostic-api  --------------- /
-                 (FastAPI: sessions, tool-use loop, RAG search, findings)
-                                       |
-                              Streamlit chat ui
-```
+![Architecture: docker compose services, ports, volumes and external calls](architecture.png)
+
+*(source: `architecture.dot`, regenerate with `dot -Tpng -Gdpi=150 architecture.dot -o architecture.png`)*
 
 - **The pricing side is deterministic.** A rule engine sets prices within SAP's floor, maximum markdown and
   ladder rules; an independent validation gate re-checks every rule before anything is sent, so a defect can
@@ -55,13 +45,25 @@ DuckDB (warehouse: sales, inventory, price history)          Postgres (run state
 339 automated tests, most of them requiring nothing but Python; the rest need the Postgres container. See
 `docs/PROJECT_CONTEXT.md` (local, not tracked in git) for the full design write-up.
 
+## Requirements
+
+- **Python 3.11+** (the Anthropic SDK's 1.x line needs it). On macOS, `python3` on `PATH` is often the
+  system's old bundled Python (3.9), not a modern one — check `python3 --version` first, or point the venv
+  at a specific interpreter (e.g. `/opt/homebrew/bin/python3.13`, or whatever `pyenv`/`conda` gives you).
+  Using the wrong one won't fail loudly; pip will just silently resolve several packages down to old
+  versions still compatible with it.
+- **Docker** and **Docker Compose** (for Postgres, mock-sap, and optionally diagnostic-api/ui as containers).
+- An [Anthropic API key](https://console.anthropic.com) for real answers — optional; `LLM_PROVIDER=scripted`
+  runs the assistant offline with no key, replaying a canned investigation.
+- **`requirements.txt`** is the human-edited list of what's needed, unpinned except where a version genuinely
+  matters (`duckdb`, pinned to match across the containers that share the same warehouse file). For an exact,
+  reproducible set of versions, install from **`requirements-lock.txt`** instead (regenerate it with a clean
+  venv built from the *correct* interpreter — see `requirements-lock.txt`'s own header for the exact command).
+
 ## Quick start
 
-Needs Python 3.12+, Docker, and an [Anthropic API key](https://console.anthropic.com) for real answers
-(the assistant also has an offline `scripted` mode that needs no key).
-
 ```bash
-python -m venv .venv && .venv/bin/pip install -r requirements.txt
+python3.13 -m venv .venv && .venv/bin/pip install -r requirements.txt   # or requirements-lock.txt to pin exact versions
 cp .env.example .env    # then set ANTHROPIC_API_KEY and LLM_PROVIDER=anthropic
 ```
 

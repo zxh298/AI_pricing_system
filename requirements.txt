@@ -5,6 +5,7 @@ pytest
 ipykernel
 matplotlib
 fastapi
+pydantic
 uvicorn
 httpx
 psycopg[binary]

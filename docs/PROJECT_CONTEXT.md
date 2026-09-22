@@ -703,6 +703,49 @@ docker compose up -d postgres mock-sap
 
 ---
 
+## 18. Scaling to production volume (millions of rows/week)
+
+This simulator runs ~138 candidate rows/week, entirely in memory, against a single DuckDB file. That is
+deliberately toy-scale. Honest split of what the current design already anticipates versus what would need
+real rework at, say, millions of SKU x region rows/week:
+
+### Already anticipated, would not need to change
+- **DuckDB -> BigQuery is the intended swap, not an afterthought.** `shared/warehouse.py`'s
+  `BigQueryWarehouse` already mirrors `DuckDBWarehouse`'s interface. DuckDB's single-writer limit is
+  exactly why it is the *local* stand-in, never the production store (section 7).
+- **Batched, retrying sends already have the right shape.** `sender.py` posts in configurable batches,
+  retries 429/5xx with backoff honouring `Retry-After`, tracks status per record. At real volume this needs
+  a larger batch size and real concurrency instead of one sequential loop, not a different design.
+- **Idempotency stays cheap as volume grows.** Records are keyed by `run_id + sku + pack_qty + region`, so a
+  rerun only resends what was not accepted. Cost is proportional to what is still wrong, not to total volume.
+- **The diagnostic tools already cap their own blast radius.** `MAX_SKUS = 500` per call and collapsing
+  results into patterns instead of per-row output was built to keep the LLM's context small -- it is also
+  exactly the discipline real scale needs: never let a tool try to load millions of rows into one response.
+
+### Would need genuine new work
+1. **Ingestion can't stay a single GET into memory.** `jobs/sap_ingest.py` pulls the whole candidate list
+   into a Python list. At millions of rows this becomes a bulk export (SAP -> GCS -> BigQuery load job, or a
+   paginated/streaming API), not one REST call returning JSON in one shot.
+2. **The pricing engine is row-by-row Python today.** `price_week()` loops over candidates. Fine at 138
+   rows; would not finish in a useful window at millions. Needs the pricing logic pushed into a SQL query
+   BigQuery runs in parallel, or a distributed job (Dataflow/Spark), not a for-loop at any batch size.
+3. **Per-run state in Postgres needs reconsidering.** `pipeline_records` writes one row per SKU/region per
+   run -- fine at hundreds, questionable as an OLTP table at millions. Section 1.2's own split already
+   points at the answer: full history and audit go to BigQuery; Cloud SQL keeps only the current run's
+   *snapshot*, never a row for every record ever sent.
+4. **The weekly cutoff becomes a real constraint, not a formality.** Processing millions of rows
+   sequentially within one shift's window forces parallelism through the whole chain -- pricing, validation,
+   sending -- not just at the send step.
+5. **Diagnostic queries need to move into SQL.** `core.py`'s `diagnose()` loops over SKUs x regions in
+   Python. At scale this becomes a BigQuery query the tool triggers, not something computed by iterating in
+   the API process -- the 500-row cap is a workaround for a Python loop, not a limit a SQL engine would need.
+
+**Throughline:** everything oriented around status, retries and idempotency is already right and would not
+change. Everything oriented around holding all the rows in one Python process would need to become a
+data-warehouse query or a distributed job instead.
+
+---
+
 ## Appendix A. Interview talking points (short)
 
 - **System framing:** "SAP was the system of record: each week it provided the clearance
@@ -722,6 +765,11 @@ docker compose up -d postgres mock-sap
 - **Memory:** "Structured facts lived in code-managed session state with group handles;
   older tool outputs were compacted; current status was always re-queried. Long-term
   memory was confirmed root causes, not chat history."
+- **Scale:** "This demo runs hundreds of rows in memory against DuckDB. At real volume the retry,
+  idempotency and status-tracking design would not change -- only the parts that hold every row in one
+  Python process would: ingestion becomes a bulk load instead of a REST call, pricing becomes a warehouse
+  query or a distributed job instead of a loop, and per-run state in Cloud SQL stays a snapshot, with full
+  history moving to BigQuery, exactly as the architecture already splits it (see section 18)."
 - **Repeat questions:** "We cached tool results keyed on a structured intent, the data
   version and permission scope, never on text similarity; repeat questions got a diff since
   the last check; only human-confirmed findings were shared."

@@ -1,0 +1,71 @@
+digraph architecture {
+  rankdir=TB;
+  fontname="Helvetica";
+  graph [fontsize=20, labelloc=t, label="AI Pricing System -- local architecture (docker compose)", pad=0.4, nodesep=0.5, ranksep=0.6];
+  node [fontname="Helvetica", fontsize=10.5, shape=box, style="rounded,filled", fillcolor="#ffffff", color="#4a5568", penwidth=1.3];
+  edge [fontname="Helvetica", fontsize=9.5, color="#4a5568"];
+
+  browser [label="Browser", shape=oval, fillcolor="#eef2ff"];
+
+  subgraph cluster_external {
+    label="External APIs (no container, no Docker involved)";
+    style="dashed"; color="#a0aec0"; fontsize=10.5; fontcolor="#718096";
+    anthropic [label="Anthropic API\nclaude-haiku-4-5", fillcolor="#fff7ed"];
+    hf [label="Hugging Face Hub\n(fastembed model,\nfirst startup only)", fillcolor="#fff7ed"];
+  }
+
+  subgraph cluster_host {
+    label="host machine, outside Docker entirely";
+    style="dashed"; color="#c05621"; fontsize=10.5; fontcolor="#c05621";
+    ragingest [label="rag-ingest\n\nNOT a container -- no Dockerfile,\nno docker-compose.yml entry.\nrun: .venv/bin/python -m jobs.rag_ingest", shape=note, fillcolor="#fffaf0", style="filled"];
+  }
+
+  subgraph cluster_compose {
+    label="docker compose  (docker-compose.yml) -- one image per service";
+    style="rounded"; color="#2b6cb0"; fontsize=13; fontcolor="#2b6cb0"; penwidth=1.6;
+
+    subgraph cluster_pulled {
+      label="pulled image (not built from this repo)";
+      style="rounded"; color="#805ad5"; fontsize=10; fontcolor="#6b46c1";
+      pg [label="postgres  :5432\nimage: pgvector/pgvector:pg16", shape=cylinder, fillcolor="#faf5ff"];
+    }
+
+    subgraph cluster_builtalways {
+      label="built from this repo -- always-on services";
+      style="rounded"; color="#38a169"; fontsize=10; fontcolor="#2f855a";
+
+      ui [label="ui  :8501\nservices/ui/Dockerfile\nimage: ai_pricing_system-ui\nStreamlit -- no DB/SAP access", fillcolor="#f0fff4"];
+      diag [label="diagnostic-api  :8000\nservices/diagnostic_api/Dockerfile\nimage: ai_pricing_system-diagnostic-api\nSAP_READ_KEY only, DuckDB mounted :ro", fillcolor="#f0fff4"];
+      sap [label="mock-sap  :8001\nservices/mock_sap/Dockerfile\nimage: ai_pricing_system-mock-sap\nSAP_READ_KEY + SAP_WRITE_KEY", fillcolor="#f0fff4"];
+    }
+
+    subgraph cluster_builtjobs {
+      label="built from this repo -- compose profile \"jobs\", run on demand";
+      style="dashed"; color="#b7791f"; fontsize=10; fontcolor="#b7791f";
+
+      pipeline [label="weekly-pipeline\njobs/weekly_pipeline/Dockerfile\nimage: ai_pricing_system-weekly-pipeline\ndocker compose run --rm weekly-pipeline\nSAP_READ_KEY + SAP_WRITE_KEY", fillcolor="#fffbea"];
+    }
+
+    duckdb [label="warehouse.duckdb\n./data volume\n(not itself a container)", shape=cylinder, fillcolor="#f7fafc"];
+  }
+
+  playbooks [label="playbooks/\nsynthetic corpus\n(host filesystem, read by rag-ingest)", shape=folder, fillcolor="#fffaf0"];
+
+  browser -> ui [label="http"];
+  ui -> diag [label="HTTP, X-User / X-Role\nDIAGNOSTIC_API_URL"];
+
+  diag -> pg [label="sessions, cache,\nfindings, RAG vectors"];
+  diag -> sap [label="GET only\n(read key)"];
+  diag -> duckdb [label="read-only mount\n./data:/data:ro"];
+  diag -> anthropic [label="tool-use loop"];
+  diag -> hf [style=dashed, label="embedding model"];
+
+  pipeline -> sap [label="GET candidates\nPOST prices (write key)"];
+  pipeline -> duckdb [label="./data:/data\n(single writer)"];
+  pipeline -> pg [label="run state\n(pipeline schema)"];
+
+  ragingest -> playbooks [label="chunk"];
+  ragingest -> pg [label="embed -> pgvector\n(knowledge schema)\nreaches the container's\npublished port 5432"];
+
+  sap -> pg [label="candidates, rules,\nprice conditions\n(sap schema)"];
+}
