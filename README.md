@@ -85,6 +85,30 @@ Open **http://localhost:8501**, start a session, and ask:
 
 > Larkspur clearance this week: many prices didn't drop in VIC, NSW is fine. Why?
 
+## Example questions and how they're answered
+
+The LLM never touches a database or writes SQL. Every question routes through one of a small set of
+read-only tools, each backed by a specific store; the table below traces that path for real questions
+against this repo's own seeded demo data (`2026-W39`), with the answers either pulled straight from the
+tool or from an actual live run of the assistant.
+
+| # | Question | Tool(s) | What runs underneath | Terminates in | Answer |
+|---|---|---|---|---|---|
+| 1 | "What's on this week's list for Larkspur?" | `resolve_products` | `ctx.wh.get_candidates(week)` — filters in Python by brand after | DuckDB SQL (`shared/warehouse.py`) | 13 SKUs: `100002, 100012, 100013, 100014, 100024, 100041, 100042, 100048, 100050, 100079, 100084, 100088, 100097` |
+| 2 | "Why didn't VIC prices drop?" | `diagnose_batch` | `ctx.wh.get_candidates`/`get_recommendations`/`get_rules` **+** `GET /pricing/conditions` on mock-sap, then `core.diagnose()` (pure Python) combines them | **Two** stores: DuckDB SQL, and an HTTP call (mock-sap runs its own SQL invisibly to diagnostic-api) | "Here are the three VIC products with active promotions overriding clearance: [100012 \$16.79→\$12.49, 100013 \$13.49→\$10.07, 100014 \$17.99→\$12.59]... The Promotions team needs to review these promotions and decide whether to let them continue or adjust them." |
+| 3 | "What price does SAP actually hold for these SKUs?" | `get_sap_conditions` | `GET /pricing/conditions` on mock-sap | HTTP only — no direct DB access from diagnostic-api | All three overridden by `PROMOTION`: 100012 sent 16.79 / effective 12.49; 100013 sent 13.49 / effective 10.07; 100014 sent 17.99 / effective 12.59 |
+| 4 | "What did SAP say when it rejected these records?" | `get_api_log` | `GET /pricing/submissions` on mock-sap | HTTP only | 9 problems, all `VALIDITY_OVERLAP`, 3 per region for SKUs 100017/100019/100020 — "overlaps existing condition record (run LEGACY-PREV-WEEK, 2026-09-14 to 2099-12-31)" |
+| 5 | "Would these go below floor if the promotion ended?" | `check_rules` | `ctx.wh.get_recommendations`/`get_rules` (SQL), then `validate_rows()` — the same pure function the pipeline itself uses | DuckDB SQL **+** pure Python (no I/O in the check itself) | "The three SKUs passed the price floor rule check with no violations... it does not show the floor amount itself... someone with access to the floor thresholds would need to compare them." |
+| 6 | "Is this a known issue?" | `get_findings` | `ctx.findings.list()` | Postgres SQL (`findings.py`) | 0 findings for `2026-W39` — none recorded yet |
+| 7 | "What do I do about a 429?" | `search_docs` | `ctx.kb.search()` — tag lookup (SQL array match) first, pgvector similarity as fallback | Postgres SQL (`knowledge.py`) | "**Next steps** [PB-API-TRANSIENT]: 1. Wait for SAP to recover, then rerun with the same run id... 2. If 429 repeats, reduce the batch size... 3. If it lasts more than an hour, escalate to the SAP Pricing team." |
+| 8 | "What's the weather today?" | *(none)* | the model declines directly from the system prompt's rules — no tool call emitted | nothing — no store, no HTTP, no SQL touched | "I don't have tools to answer questions about delivery truck schedules... My role is to diagnose issues with the weekly retail clearance pricing system." |
+| 9 | *(an analyst records a finding — not a chat question)* | *(none)* | `POST /findings` → `FindingsStore.create()` directly | Postgres SQL — bypasses the model entirely | example response shape: `{"finding_id": 1, "status": "open", "confirmed_by": "ana", ...}` |
+
+Row 5 is left exactly as the model produced it, not touched up: `check_rules` already answered the question
+(zero violations on the recommended prices *is* "no, it would not go below floor"), but the model hedged
+instead of stating that plainly — a real, first-try answer, kept here because it's a fair example of where
+the prompt could be tightened rather than only showing the cases that went well.
+
 ## Tests
 
 ```bash
