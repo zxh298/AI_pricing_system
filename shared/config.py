@@ -28,7 +28,8 @@ class Config:
     embedding_provider: str = "fastembed"         # fastembed | hash (hash is for tests: it does not understand meaning)
     embedding_model: str = "BAAI/bge-small-en-v1.5"
     embedding_cache_dir: str = ""                 # where the model is stored; default ~/.cache/ai_pricing_fastembed
-    search_min_score: float = 0.65                # documents less similar than this are not returned by similarity search
+    search_min_score: float = 0.67                # documents less similar than this are not returned by similarity search
+                                                   # (set from evals/retrieval.py: separates on-topic from off-topic at 0.67)
 
 
 def load_config() -> Config:
@@ -51,5 +52,5 @@ def load_config() -> Config:
         embedding_provider=e("EMBEDDING_PROVIDER", "fastembed"),
         embedding_model=e("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5"),
         embedding_cache_dir=e("EMBEDDING_CACHE_DIR", ""),
-        search_min_score=float(e("SEARCH_MIN_SCORE", "0.65")),
+        search_min_score=float(e("SEARCH_MIN_SCORE", "0.67")),
     )

@@ -41,14 +41,14 @@ def tags_for(code: str | None, reason: str | None) -> tuple[list[str], list[str]
 
 
 def tags_in_query(query: str, known: set[str]) -> list[str]:
-    """Known `CODE:reason` tags whose reason is mentioned in a question, in words or as a number: 'validity overlaps'
-    finds API_REJECTED:VALIDITY_OVERLAP and 'HTTP 429' or '429' finds API_REJECTED:HTTP_429."""
+    """Known tags mentioned in a question, in words or as a number: 'validity overlaps' finds
+    API_REJECTED:VALIDITY_OVERLAP, 'HTTP 429' or '429' finds API_REJECTED:HTTP_429, and a tag that is a bare code
+    (PRICE_MISMATCH) is found by the words of the code. The words matched are the reason of a `CODE:reason` tag, so a
+    question about a code alone does not pull in every reason of it."""
     text = " " + re.sub(r"[^a-z0-9]+", " ", query.lower()) + " "
     hits = []
     for tag in sorted(known):
-        if ":" not in tag:
-            continue
-        reason = tag.split(":", 1)[1]
+        reason = tag.split(":", 1)[1] if ":" in tag else tag
         phrase = re.escape(reason.lower().replace("_", " "))
         number = re.fullmatch(r"HTTP_(\d{3})", reason)
         if re.search(rf"(?<![a-z0-9]){phrase}s?(?![a-z0-9])", text) or (number and f" {number.group(1)} " in text):
@@ -141,6 +141,28 @@ class KnowledgeBase:
                 out[tag] = {"doc_id": row["doc_id"], "title": row["title"], "owner": row["owner"],
                             "severity": row["severity"], "what_to_do": steps or None}
         return out
+
+    def scores(self, query: str) -> list[dict]:
+        """Every chunk with its similarity to the question, best first. Used to measure retrieval; search uses `similar`."""
+        vec = vector_literal(self.embedder.embed_query(query))
+        s = schema()
+        rows = self._rows(f"""SELECT c.doc_id, d.doc_type, c.section, 1 - (c.embedding <=> %s::vector) AS score
+                              FROM {s}.chunks c JOIN {s}.docs d USING (doc_id) ORDER BY score DESC""", (vec,))
+        return [{**r, "score": float(r["score"])} for r in rows]
+
+    def search(self, query: str | None = None, error_code: str | None = None, reason: str | None = None) -> dict:
+        """Tag lookup first, similarity second. Returns {version, found, tags_used, docs (by tag), similar}. The one
+        place this logic lives: the search_docs tool and the retrieval evaluation both call it."""
+        version, known = self.docs_version(), self.known_tags()
+        specific, fallback = tags_for(error_code, reason)
+        used = list(dict.fromkeys(specific + tags_in_query(query or "", known)))
+        docs = self.by_tags(used)
+        if not docs and fallback:                                  # no playbook for that reason: the code's glossary page
+            used, docs = fallback, self.by_tags(fallback)
+        bar = max(self.min_score, RELATED_MIN_SCORE) if any(d["doc_type"] == "playbook" for d in docs) else None
+        similar = self.similar(query, {d["doc_id"] for d in docs}, bar) if (query or "").strip() else []
+        found = any(d["doc_type"] in ("playbook", "incident") for d in docs) or bool(similar)
+        return {"version": version, "found": found, "tags_used": used, "docs": docs, "similar": similar}
 
     def similar(self, query: str, exclude: set[str] = frozenset(), min_score: float | None = None) -> list[dict]:
         """The best chunk of each document that is close enough to the question, best first."""
