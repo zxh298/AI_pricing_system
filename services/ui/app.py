@@ -1,4 +1,4 @@
-"""Streamlit chat UI for the diagnostic assistant (build step 7).
+"""Streamlit UI for the weekly triage and the diagnostic assistant (build steps 7 and 10).
 
     streamlit run services/ui/app.py
 
@@ -25,6 +25,9 @@ from shared.envfile import load_dotenv
 load_dotenv()
 st.set_page_config(page_title="Clearance Pricing Diagnostics", page_icon=":bar_chart:", layout="wide")
 
+ROLES = ["viewer", "stakeholder", "analyst"]
+REJECTIONS = {"The cause is wrong": "wrong_cause", "We are the wrong owner": "wrong_owner",
+              "We cannot do this action": "action_refused"}
 DEFAULTS = {"user": "alice", "role": "viewer", "session": None, "last_tool_calls": [], "last_flags": {}, "flash": None}
 for _key, _value in DEFAULTS.items():
     st.session_state.setdefault(_key, _value)
@@ -53,12 +56,11 @@ def _client(base_url: str, user: str, role: str | None) -> ApiClient:
 with st.sidebar:
     st.header("Identity")
     st.session_state.user = st.text_input("User (X-User)", st.session_state.user, key="user_input")
-    st.session_state.role = st.selectbox("Role", ["viewer", "analyst"],
-                                         index=["viewer", "analyst"].index(st.session_state.role), key="role_select")
+    st.session_state.role = st.selectbox("Role", ROLES, index=ROLES.index(st.session_state.role), key="role_select")
     st.caption("A stand-in for IAP locally; the model never sees this or decides what you may see.")
     api_url = st.text_input("diagnostic-api URL", load_config().diagnostic_api_url, key="api_url_input")
 
-client = _client(api_url, st.session_state.user, st.session_state.role if st.session_state.role == "analyst" else None)
+client = _client(api_url, st.session_state.user, None if st.session_state.role == "viewer" else st.session_state.role)
 
 with st.sidebar:
     st.divider()
@@ -83,7 +85,124 @@ with st.sidebar:
     except Exception:
         st.error("diagnostic-api not reachable", icon=":material/error:")
 
-tab_chat, tab_findings = st.tabs(["Chat", "Findings"])
+show_flash()
+tab_triage, tab_chat, tab_findings = st.tabs(["Weekly Triage", "Chat", "Findings"])
+
+
+def ask_about(case: dict) -> None:
+    """Carry a case into chat as a first question."""
+    if st.session_state.session is None:
+        st.session_state.session = client.create_session(case["week"])
+    question = (f"Case {case['case_id']}: {case['error_code']} {case['reason']} in {'/'.join(case['regions'])}"
+                f" for skus {', '.join(sorted({r['sku'] for r in case['records']})[:10])}. What is the current status?")
+    client.post_message(st.session_state.session["session_id"], question)
+
+
+def show_case(c: dict) -> None:
+    title = f"#{c['case_id']} · {c['error_code']}" + (f":{c['reason']}" if c["reason"] else "")
+    scope = f"{c['record_count']} records · {'/'.join(c['regions'])}" + (f" · {c['brand']}" if c["brand"] else "")
+    with st.expander(f"{title} · {c['confidence']} · {c['owner']} · {c['status']} · {scope}"):
+        if c.get("partial"):
+            st.info("You can see only part of this case, because it covers regions outside your access.")
+        label = {"CONFIRMED": "Reason", "LIKELY": "Possible reason, not proven", "UNCLASSIFIED": "Evidence summary"}
+        if c["proposed_reason"]:
+            st.markdown(f"**{label[c['confidence']]}:** {c['proposed_reason']}")
+        else:
+            st.caption("No proposal: the case went to the development team with its evidence.")
+        if c["proposed_action"]:
+            st.markdown(f"**Proposed action:**\n\n{c['proposed_action']}")
+        if c["do_not"]:
+            st.warning(c["do_not"])
+        if c["doc_id"]:
+            st.caption(f"Playbook {c['doc_id']}")
+        run = c.get("investigation") or {}
+        if run.get("status") in ("over_budget", "held_by_breaker", "no_llm", "failed", "step_limit", "refused"):
+            st.caption(f"Not investigated: {run['status']}")
+        for found in run.get("causes", []):
+            st.markdown(f"**Evidence for {found['cause']}:**\n\n" + "\n".join(f"- {line}" for line in found["evidence"]))
+        if run.get("dropped"):
+            st.warning("Dropped by code, no signal behind them: " + ", ".join(d["cause"] for d in run["dropped"]))
+        if run.get("unverified"):
+            st.warning("Quotes values not found in the evidence: " + ", ".join(run["unverified"]))
+        for line in run.get("ruled_out", []):
+            st.caption(f"Ruled out: {line}")
+        for line in run.get("not_verified", []):
+            st.caption(f"Not verified: {line}")
+        if run.get("trace"):
+            st.caption("Steps: " + " → ".join(t["tool"] for t in run["trace"]))
+        st.dataframe([{k: r.get(k) for k in ("sku", "pack_qty", "region", "detail")} for r in c["records"][:50]],
+                     width='stretch', hide_index=True)
+
+        if st.button("Ask in Chat", key=f"ask-{c['case_id']}"):
+            try:
+                ask_about(c)
+                flash("info", "Asked in the Chat tab.")
+                st.rerun()
+            except ApiError as e:
+                st.error(e.detail)
+        if st.session_state.role == "viewer" or c["status"] not in ("open", "escalated") or c.get("partial"):
+            return
+        note = st.text_input("Note", key=f"note-{c['case_id']}")
+        left, middle, right = st.columns(3)
+        try:
+            if left.button("Accept", key=f"accept-{c['case_id']}", width='stretch'):
+                client.accept_case(c["case_id"], note or None)
+                flash("success", f"Case #{c['case_id']} accepted. It closes when a re-scan no longer finds it.")
+                st.rerun()
+            if middle.button("Waive this week", key=f"waive-{c['case_id']}", width='stretch', disabled=not note):
+                client.waive_case(c["case_id"], note)
+                flash("success", f"Case #{c['case_id']} waived.")
+                st.rerun()
+            why = right.selectbox("Reject because", list(REJECTIONS), key=f"why-{c['case_id']}")
+            new_owner = right.text_input("New owner", key=f"owner-{c['case_id']}") if REJECTIONS[why] == "wrong_owner" else None
+            if right.button("Reject", key=f"reject-{c['case_id']}", width='stretch'):
+                client.reject_case(c["case_id"], REJECTIONS[why], note or None, new_owner or None)
+                flash("success", f"Case #{c['case_id']} rejected.")
+                st.rerun()
+        except ApiError as e:
+            st.error(e.detail)
+
+
+# ---------------- weekly triage ----------------
+with tab_triage:
+    st.subheader("Weekly triage")
+    t_week = st.text_input("Week", value=load_config().default_week, key="t_week")
+    try:
+        scans = client.list_scans(t_week or None)
+        cases = client.list_cases(t_week or None, "all")
+        sent = client.list_notifications(t_week or None)
+    except ApiError as e:
+        st.error(f"Could not load the triage: {e.detail}")
+        scans, cases, sent = [], [], []
+    if scans:
+        last = scans[0]
+        s = last["summary"]
+        if last["status"] == "BREAKER":
+            st.error("Mass failure: treated as one incident. Owners were not paged and no LLM ran.")
+        elif last["status"] == "INCIDENT":
+            st.error(s.get("detail", "The week could not be scanned."))
+        else:
+            one, two, three, four = st.columns(4)
+            one.metric("Records checked", s["records_checked"])
+            two.metric("Records failing", s["records_failing"])
+            three.metric(f"Not selling ({last['outcome_week']})", s["outcome_flagged"])
+            four.metric("LLM steps", s["llm_steps"])
+    else:
+        st.caption("No scan for this week yet. It runs after the weekly pipeline: python -m jobs.weekly_triage")
+    active = [c for c in cases if c["status"] in ("open", "escalated")]
+    for c in active:
+        show_case(c)
+    rest = [c for c in cases if c["status"] not in ("open", "escalated")]
+    if rest:
+        st.divider()
+        st.caption("Decided or closed")
+        for c in rest:
+            show_case(c)
+    if sent:
+        with st.expander(f"Notifications sent ({len(sent)})"):
+            for n in sent:
+                st.markdown(f"**{n['team']}** · {n['kind']} · {n['subject']}")
+                st.text(n["body"])
 
 # ---------------- chat ----------------
 with tab_chat:
@@ -122,6 +241,13 @@ with tab_chat:
                             st.json(c["input"], expanded=False)
 
             flags = st.session_state.last_flags
+            if flags.get("intent"):
+                st.caption(f"intent `{flags['intent']}` · route `{flags['route']}`")
+            if flags.get("route") == "fallback":
+                st.info("No fixed workflow covers this question; the answer comes from an open-ended investigation.")
+            if flags.get("unverified"):
+                st.warning("The last answer quotes values not found in the results it was written from: "
+                           + ", ".join(flags["unverified"]))
             if flags.get("escalated"):
                 st.warning("The assistant hit its step limit and escalated instead of answering.")
             if flags.get("truncated"):
@@ -133,7 +259,9 @@ with tab_chat:
                     try:
                         out = client.post_message(s["session_id"], question)
                         st.session_state.last_tool_calls = out["tool_calls"]
-                        st.session_state.last_flags = {"escalated": out["escalated"], "truncated": out["truncated"]}
+                        st.session_state.last_flags = {"escalated": out["escalated"], "truncated": out["truncated"],
+                                                       "intent": out.get("intent"), "route": out.get("route"),
+                                                       "unverified": out.get("unverified", [])}
                     except ApiError as e:
                         st.error(e.detail)
                         if e.status_code in (404, 410):
@@ -146,7 +274,6 @@ with tab_chat:
 # ---------------- findings ----------------
 with tab_findings:
     st.subheader("Confirmed findings")
-    show_flash()
     col1, col2, col3 = st.columns([2, 2, 1])
     f_week = col1.text_input("Week", value=(st.session_state.session or {}).get("week", ""), key="f_week")
     f_status = col2.selectbox("Status", ["open", "resolved", "all"], key="f_status")

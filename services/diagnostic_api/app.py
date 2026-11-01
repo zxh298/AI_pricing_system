@@ -6,12 +6,22 @@
     GET  /findings                     open issues a person confirmed (only regions the user may see)
     POST /findings                     record a confirmed issue                   (role: analyst)
     POST /findings/{id}/resolve        close a finding                            (role: analyst)
+    GET  /triage/scans                 the weekly scans and what each found
+    GET  /triage/cases                 this week's grouped problems, most urgent first
+    GET  /triage/cases/{id}            one case with its history
+    POST /triage/cases/{id}/accept     agree with the proposal; writes findings   (role: stakeholder or analyst)
+    POST /triage/cases/{id}/waive      accept an exception for these records      (role: stakeholder or analyst)
+    POST /triage/cases/{id}/reject     wrong_cause | wrong_owner | action_refused (role: stakeholder or analyst)
+    GET  /triage/notifications         what was sent to each team
     GET  /healthz
 
 Identity comes from the X-User header only (a stand-in for IAP: on Cloud Run the platform sets it after
 authenticating). It is never read from a body, a query string or the model. What a user may see comes from
 USER_REGIONS and is injected into the tools; the model cannot change it. Writing findings needs X-Role: analyst
-(a stand-in for a group check on GCP); the model has no tool that writes them.
+(a stand-in for a group check on GCP), or stakeholder when accepting a triage case; the model has no tool that writes
+them. A user who may see only some of a case's regions sees that part of it and cannot decide it.
+AGENT_MODE picks how a turn runs: `router` (classify -> fixed workflow -> explain, router.py) or `loop` (the open
+tool-use loop, agent.py).
 Run:  uvicorn services.diagnostic_api.app:app --port 8000     (reads .env from the current directory)
 """
 from __future__ import annotations
@@ -20,6 +30,7 @@ import dataclasses
 import json
 import logging
 from contextlib import asynccontextmanager
+from typing import Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -30,10 +41,12 @@ from services.diagnostic_api.cache import ToolCache
 from services.diagnostic_api.findings import FindingsStore, render_block
 from services.diagnostic_api.knowledge import KnowledgeBase
 from services.diagnostic_api.llm import get_llm
+from services.diagnostic_api.router import run_router
 from services.diagnostic_api.runs import RunResolver
 from services.diagnostic_api.sessions import SessionError, SessionStore
 from services.diagnostic_api.state import SessionState, compact_history
 from services.diagnostic_api.tools import make_context
+from services.diagnostic_api.triage_store import CaseConflict, CaseStore
 from shared.config import load_config
 from shared.envfile import load_dotenv
 
@@ -42,6 +55,21 @@ log = logging.getLogger("diagnostic.api")
 
 class NewSession(BaseModel):
     week: str | None = Field(default=None, pattern=r"^\d{4}-W\d{2}$")
+
+
+class Decision(BaseModel):
+    note: str | None = Field(default=None, max_length=1000)
+    ticket: str | None = Field(default=None, max_length=80)
+
+
+class Waiver(BaseModel):
+    note: str = Field(min_length=1, max_length=1000)
+
+
+class Rejection(BaseModel):
+    reason: Literal["wrong_cause", "wrong_owner", "action_refused"]
+    note: str | None = Field(default=None, max_length=1000)
+    new_owner: str | None = Field(default=None, min_length=1, max_length=80)
 
 
 class NewMessage(BaseModel):
@@ -73,6 +101,12 @@ def analyst(user: str = Depends(current_user), x_role: str | None = Header(defau
     return user
 
 
+def decider(user: str = Depends(current_user), x_role: str | None = Header(default=None)) -> str:
+    if x_role not in ("analyst", "stakeholder"):
+        raise HTTPException(403, "stakeholder or analyst role required")
+    return user
+
+
 def regions_for(user: str, raw: str) -> frozenset[str] | None:
     """USER_REGIONS='{"nsw-analyst": ["NSW"]}'. None = every region (users that are not listed)."""
     regions = json.loads(raw).get(user) if raw else None
@@ -80,15 +114,18 @@ def regions_for(user: str, raw: str) -> frozenset[str] | None:
 
 
 def create_app(store: SessionStore | None = None, llm_factory=get_llm, ctx_factory=None, runs=None, cache=None,
-               findings=None, kb=None, warm_knowledge: bool = False) -> FastAPI:
+               findings=None, kb=None, warm_knowledge: bool = False, mode: str | None = None, cases=None) -> FastAPI:
     """`llm_factory(week)`, `ctx_factory(user, allowed_regions)`, `runs` (finds the newest pipeline run of a week),
     `cache`, `findings` and `kb` (the knowledge base) are injectable so tests need no key, SAP, pipeline state or
-    embedding model. `warm_knowledge` loads the embedding model at startup, so the first question does not wait for it."""
+    embedding model. `warm_knowledge` loads the embedding model at startup, so the first question does not wait for it.
+    `mode` (router | loop) overrides AGENT_MODE."""
     store = store or SessionStore()
     runs = runs or RunResolver()
     cache = cache or ToolCache()
     findings = findings or FindingsStore()
     kb = kb or KnowledgeBase()
+    cases = cases or CaseStore(response_hours=load_config().triage_response_hours,
+                               decision_owner=load_config().triage_decision_owner)
     owns_ctx = ctx_factory is None
     ctx_factory = ctx_factory or (lambda user, regions: make_context(user, regions))
 
@@ -139,9 +176,10 @@ def create_app(store: SessionStore | None = None, llm_factory=get_llm, ctx_facto
             base = ctx_factory(user, allowed)
             known = findings.list(week=s["week"], status="open", allowed_regions=allowed)   # shown to the model by us
             ctx = dataclasses.replace(base, state=state, runs=runs, cache=cache, findings=findings, kb=kb)   # a copy for this turn
+            turn_fn = run_router if (mode or cfg.agent_mode) == "router" else run_turn
             try:
-                out = run_turn(body.text, ctx, llm_factory(s["week"]), s["week"], history=history,
-                               state_block="\n\n".join(b for b in (state.render(), render_block(known)) if b))
+                out = turn_fn(body.text, ctx, llm_factory(s["week"]), s["week"], history=history,
+                              state_block="\n\n".join(b for b in (state.render(), render_block(known)) if b))
             except Exception:                                                # noqa: BLE001 - nothing was saved
                 log.exception("turn failed in session %s", session_id)
                 raise HTTPException(502, "the assistant is unavailable; nothing was saved") from None
@@ -150,9 +188,10 @@ def create_app(store: SessionStore | None = None, llm_factory=get_llm, ctx_facto
                     base.sap.close()
             turn = store.save_turn(s, state=state.to_json(), history=out["messages"], question=body.text,
                                    answer=out["answer"], tool_calls=out["tool_calls"],
-                                   messages=out["messages"][len(history):])
+                                   messages=out["messages"][len(history):], trace=out.get("trace"))
         return {"turn": turn, "answer": out["answer"], "tool_calls": out["tool_calls"], "steps": out["steps"],
-                "escalated": out["escalated"], "truncated": out["truncated"]}
+                "escalated": out["escalated"], "truncated": out["truncated"], "intent": out.get("intent"),
+                "route": out.get("route", "loop"), "unverified": out.get("unverified", [])}
 
     def visible(finding: dict, user: str) -> bool:
         allowed = regions_for(user, load_config().user_regions)
@@ -180,6 +219,70 @@ def create_app(store: SessionStore | None = None, llm_factory=get_llm, ctx_facto
         if closed is None:
             raise HTTPException(409, "finding is already resolved")
         return closed
+
+    def scoped(case: dict, user: str) -> dict | None:
+        """The part of a case this user may see, or None. Evidence and the investigation are only shown whole."""
+        allowed = regions_for(user, load_config().user_regions)
+        if allowed is None or set(case["regions"]) <= allowed:
+            return case
+        shown = [r for r in case["regions"] if r in allowed]
+        if not shown:
+            return None
+        records = [r for r in case["records"] if r["region"] in allowed]
+        return {**case, "regions": shown, "records": records, "record_count": len(records), "evidence": {},
+                "investigation": None, "partial": True}
+
+    def decidable(case_id: int, user: str) -> dict:
+        case = cases.get(case_id)
+        view = scoped(case, user) if case else None
+        if view is None:
+            raise HTTPException(404, "case not found")
+        if view.get("partial"):
+            raise HTTPException(403, "this case covers regions you may not see; ask someone who sees all of them")
+        return case
+
+    def deciding(call):
+        try:
+            return call()
+        except CaseConflict as e:
+            raise HTTPException(409, str(e)) from None
+        except ValueError as e:
+            raise HTTPException(422, str(e)) from None
+
+    @app.get("/triage/scans")
+    def list_scans(week: str | None = None, user: str = Depends(current_user)):
+        return cases.scans(week)
+
+    @app.get("/triage/cases")
+    def list_cases(week: str | None = None, status: str | None = None, user: str = Depends(current_user)):
+        return [v for v in (scoped(c, user) for c in cases.list(week, None if status == "all" else status)) if v]
+
+    @app.get("/triage/cases/{case_id}")
+    def read_case(case_id: int, user: str = Depends(current_user)):
+        case = cases.get(case_id)
+        view = scoped(case, user) if case else None
+        if view is None:
+            raise HTTPException(404, "case not found")
+        return {**view, "events": cases.events(case_id)}
+
+    @app.post("/triage/cases/{case_id}/accept")
+    def accept_case(case_id: int, body: Decision, user: str = Depends(decider)):
+        decidable(case_id, user)
+        return deciding(lambda: cases.accept(case_id, user, findings, body.note, body.ticket))
+
+    @app.post("/triage/cases/{case_id}/waive")
+    def waive_case(case_id: int, body: Waiver, user: str = Depends(decider)):
+        decidable(case_id, user)
+        return deciding(lambda: cases.waive(case_id, user, body.note))
+
+    @app.post("/triage/cases/{case_id}/reject")
+    def reject_case(case_id: int, body: Rejection, user: str = Depends(decider)):
+        decidable(case_id, user)
+        return deciding(lambda: cases.reject(case_id, user, body.reason, body.note, body.new_owner))
+
+    @app.get("/triage/notifications")
+    def list_notifications(week: str | None = None, user: str = Depends(current_user)):
+        return cases.notifications(week)
 
     return app
 

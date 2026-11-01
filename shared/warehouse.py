@@ -33,6 +33,10 @@ class WarehouseClient(ABC):
     def get_inventory(self, skus: list[str], week: str) -> list[dict]: ...
 
     @abstractmethod
+    def get_store_sales(self, start, end, skus: list[str] | None = None) -> list[dict]:
+        """Units and average selling price per (sku, pack_qty, store) between two dates. skus None = every sku."""
+
+    @abstractmethod
     def get_recommendations(self, week: str, run_id: str | None = None) -> list[dict]:
         """Engine output for a week (price_recommendations). run_id None = the alphabetically last run id of
         that week, which is not necessarily the newest run: callers that know the run should pass it."""
@@ -113,6 +117,20 @@ class DuckDBWarehouse(WarehouseClient):
             f" ORDER BY sku, pack_qty, region",
             [week, *skus])
 
+    def get_store_sales(self, start, end, skus=None):
+        where, params = "s.sale_date BETWEEN ? AND ?", [start, end]
+        if skus is not None:
+            if not skus:
+                return []
+            where += f" AND s.sku IN ({','.join('?' * len(skus))})"
+            params += list(skus)
+        return self._rows(
+            "SELECT s.sku, s.pack_qty, s.region, s.store_id, t.price_zone, SUM(s.units) AS units,"
+            " SUM(s.units * s.price) / NULLIF(SUM(s.units), 0) AS avg_price, MAX(s.price) AS list_price"
+            f" FROM sales s JOIN stores t USING (store_id, region) WHERE {where}"
+            " GROUP BY s.sku, s.pack_qty, s.region, s.store_id, t.price_zone"
+            " ORDER BY s.sku, s.pack_qty, s.store_id", params)
+
     def get_recommendations(self, week, run_id=None):
         try:
             return self._rows(
@@ -134,7 +152,7 @@ class BigQueryWarehouse(WarehouseClient):
         raise NotImplementedError("BigQueryWarehouse is implemented in the GCP deployment step")
 
     get_candidates = get_rules = get_sales_history = get_inventory = _todo
-    get_price_history = get_products = get_recommendations = _todo
+    get_price_history = get_products = get_recommendations = get_store_sales = _todo
 
 
 def get_warehouse(cfg: Config | None = None, read_only: bool = True) -> WarehouseClient:

@@ -245,7 +245,8 @@ the current turn**; history is only for understanding references ("that promotio
   owner, ticket, status. Checked before re-investigating; auto-resolved when the
   deterministic check shows zero failures.
 - **Memory poisoning guard:** only deterministic facts and **human-confirmed** conclusions
-  go into shared findings. The LLM has no tool that writes findings.
+  go into shared findings. The LLM has no tool that writes findings. (An analyst writes one directly; a stakeholder by
+  accepting a triage case, section 19.)
 
 Lookup order for a new question: session state (repeat → diff) → active findings → tool
 cache → full investigation → (after human confirmation) findings → incident note → RAG.
@@ -472,6 +473,8 @@ Each service/job has its own Dockerfile and requirements; build context is the r
    FakeApiClient; st.cache_resource is process-wide and must be cleared between tests).
 8. **infra:** IAM script and deploy script for GCP.
 9. Optional: deploy to Cloud Run with a budget alert.
+10. **weekly triage:** DONE (section 19). Runs after the pipeline; this is now the main way problems reach people, and chat
+    is for follow-up questions.
 
 ---
 
@@ -589,6 +592,8 @@ Status: steps 1-5 done, 207 tests. Nothing here needs BigQuery, Redis or any alw
 | `core.py` | deterministic verdict per (sku, pack_qty, region); reuses the pipeline's pure `validate_rows` and `reconcile` |
 | `tools.py` | the tools, schemas, allow-listed `execute_tool`, and the cache / diff / auto-close wrapper |
 | `agent.py` | the LLM tool-use loop (`run_turn`), system prompt, step limit with escalation |
+| `router.py` | router mode (default, section 17.11): classify -> fixed workflow -> render; falls back to `agent.py` |
+| `outcome.py`, `triage_rules.py`, `triage_store.py`, `investigate.py`, `investigation_tools.py` | the weekly triage (section 19) |
 | `llm.py` | providers: `scripted` (offline, incl. the canonical demo) and `anthropic` |
 | `state.py` | session state (groups, scope, last checks), history compaction, diffs |
 | `runs.py` | newest finished pipeline run for a week, and its `data_version` |
@@ -701,6 +706,57 @@ docker compose up -d postgres mock-sap
 .venv/bin/uvicorn services.diagnostic_api.app:app --port 8000         # POST /sessions, /sessions/{id}/messages, /findings; see /docs
 ```
 
+### 17.11 Router mode (`AGENT_MODE=router`, the default)
+
+Why: the open loop leaves tool choice, completeness and wording to the model, and section 17.9 shows a small
+model following those prompt rules unevenly. The questions this assistant gets fall into a handful of fixed
+kinds, so the model now only classifies the question and explains the result; the steps in between are code.
+
+One turn (`router.run_router`):
+1. **classify** (one model call, `tool_choice` forces the `classify` tool): an intent and the slots the user
+   gave (week, brand, category, name_contains, skus, group_id, regions, error_code, reason, query). Inputs:
+   the question, the compacted history and the session state block, so "those three" maps to a group.
+2. **validate** (code): week format, a list for that week, regions the user may see, brand and category on
+   the week's list (case-insensitive). A failure is a clarifying question naming what is available, never a guess.
+3. **workflow** (code): a fixed tool sequence per intent, through `execute_tool`, so caching, auditing,
+   the session diff and findings auto-close are unchanged.
+
+   | intent | tools |
+   |---|---|
+   | `list_products` | `resolve_products` |
+   | `diagnose` | scope -> `diagnose_batch` -> `get_sap_conditions` if NOT_EFFECTIVE / PRICE_MISMATCH -> `get_api_log` if API_REJECTED |
+   | `sap_prices` / `api_log` / `rule_check` | scope -> `get_sap_conditions` / `get_api_log` / `check_rules` |
+   | `known_issues` | `get_findings` |
+   | `how_to` | `search_docs` |
+   | `out_of_scope`, `unclear` | none: a fixed reply, or the model's one clarifying question |
+   | `other` | the open loop (`agent.run_turn`), and the answer says so (`route: fallback`) |
+
+   Scope = the session group, else explicit skus, else `resolve_products` with the filters; no match stops
+   the workflow. A failing step stops it too; the model is told what failed.
+4. **render** (one model call, no tools, no history): the question plus every step's tool, input and result
+   as JSON. The loop's reporting rules carry over. Code-written facts (diff headline, auto-closed findings)
+   still go above the answer.
+5. **check** (code): SKUs, prices and `[DOC-ID]`s the answer quotes must appear in the results it was
+   given; anything else is returned as `unverified` and shown as a warning in the ui. Counts are not checked.
+
+The response adds `intent`, `route` (workflow | clarify | fallback; `loop` in loop mode) and `unverified`;
+`turn_transcripts.trace` keeps the classification, validated slots and full step results. History stays
+question + answer, so router turns and fallback-loop turns mix freely. `AGENT_MODE=loop` restores the open
+loop. Routing quality is measured by `python -m evals.routing` (24 labelled questions incl. follow-ups,
+compound and out-of-scope ones; needs `ANTHROPIC_API_KEY`).
+
+Measured with Haiku 4.5 (2026-10-30): first prompt 88% intent / 92% slots (19/24 fully right): two questions
+lost a named brand or category, three went to `unclear` instead of `how_to` / `other`. After adding example
+questions per intent (deliberately not the eval's own questions), explicit rules for when to use `unclear`,
+`how_to` and `other`, and "fill every brand, category and region named", two runs gave 23/24 and 24/24; the one
+miss (a follow-up "what did SAP answer for them?" read as `unclear`) appeared in one run only. The code backfill
+(`router.backfill`: names from the week's list found in the question but missing from the slots) did not change
+those two runs; it stays as a deterministic safety net. No temperature setting exists to make routing
+repeatable (sampling parameters are rejected from API version 2026-10-21), so run the eval more than once
+when judging a change. Caveats: 24 questions is small, the prompt was revised after seeing the misses, and one
+gain came from relabelling "Is this a known issue?" to also accept `unclear`; grow the set with new questions
+before trusting the numbers.
+
 ---
 
 ## 18. Scaling to production volume (millions of rows/week)
@@ -746,6 +802,113 @@ data-warehouse query or a distributed job instead.
 
 ---
 
+## 19. As built: the weekly triage
+
+### 19.1 Why it replaced chat as the main workflow
+
+Chat waits for someone to notice. In the W36 incident reconciliation flagged the problem on Monday morning and a store
+manager raised it that afternoon. Section 3.2 already says that if most questions have one fixed shape, rules beat an
+LLM; "what went wrong this week and who handles it" is that shape. Chat stays, for follow-up questions.
+
+The split: **rules detect and decide, playbooks explain what is known, an LLM only goes where neither can, people confirm.**
+
+### 19.2 One scan (`jobs/weekly_triage/scan.py`)
+
+1. Stop with one incident if there is no finished run, the newest run FAILED, or SAP cannot be read.
+2. `core.diagnose()` over the whole week (not through the chat tools, so the 500-sku cap does not apply).
+3. `LOW_SELL_THROUGH` on the **last completed week**. Sales of the week being priced do not exist yet (W39 scans W38's
+   sales). A record is judged only if SAP held our price with nothing overriding it. Flagged: units <= `TRIAGE_DROP_RATIO`
+   (0.6) of the mean of the previous 3 weeks, baseline >= `TRIAGE_MIN_BASELINE` (20), and the fall is at least 3 standard
+   deviations (Poisson). "Sell-through" is units against baseline, not units against stock: `on_hand` in the synthetic data
+   is random and unrelated to volume, so a stock ratio would measure noise.
+4. Group: `(code, reason, owner)` for records, `(brand, region)` for outcomes. Match open findings (known issues stay quiet).
+5. Circuit breaker: >= `TRIAGE_BREAKER_SHARE` (0.5) of records failing, or of clean records flagged, means one upstream
+   incident: no LLM, nobody paged, no deadlines, one message to Data Platform. A later normal scan releases what is left.
+6. LLM steps for new cases, biggest first, up to `TRIAGE_MAX_INVESTIGATIONS` (5) per scan; the rest are marked `over_budget`
+   and go to development. An LLM failure leaves the case with its evidence; the scan always finishes.
+7. One digest per owner, only for new, changed or reopened cases (outbox table, shown in the ui; no real sender).
+
+### 19.3 Confidence, route, owner (`triage_rules.py`)
+
+Decided by code only. CONFIRMED: the record's evidence names the cause. LIKELY: a playbook fits but cannot be proven
+(`PRICE_MISMATCH`, `MISSING_IN_SAP`, `NOT_SENT`, `NO_RECOMMENDATION`). UNCLASSIFIED: no playbook. Reason, action and
+"do not" are the playbook's own text. Data Platform and Pricing Data Science cases go straight to development (8 of the
+17 playbooks): a business user cannot judge them, and sending them there first only delays them.
+
+### 19.4 The two LLM steps (`investigate.py`)
+
+`summarize`: one call with no data tools, only for UNCLASSIFIED: an error text nothing has seen cannot use a template. It
+gives a developer a place to start and names no cause or owner.
+
+`investigate`: a bounded read-only agent, only for LOW_SELL_THROUGH. Tools (`investigation_tools.py`, a separate allow-list
+chat cannot reach): `compare_sell_through`, `get_pos_prices`, `get_stock_trend`, `get_discount_history`, `compare_pack_prices`,
+`find_rising_products`, plus `get_sap_conditions` and `search_docs`. It ends with `submit_investigation`, choosing from
+a fixed list of causes or OTHER.
+
+The gate: code re-runs the same functions (`supported_signals`) on the skus each cause names. No signal: the cause is
+dropped. SUBSTITUTION also needs the promoted products' extra units to cover at least 25% of the units lost, in single
+units; that is necessary, not proof, since no basket data shows the same shoppers moved. OTHER never stands. A cause keeps only the skus that show it, and only skus in the case. No supported cause:
+UNCLASSIFIED, development. Owner and route come from `CAUSE_OWNERS`, never from the model. Agent cases are never better
+than LIKELY. `triage_cases.investigation` keeps every tool's input and result, so a conclusion can be traced to its data,
+and the ui shows the agent's evidence to the person deciding.
+
+Model: `TRIAGE_MODEL` = `claude-sonnet-5-5`, effort medium, with server-side refusal fallback (`fallbacks: "default"`). Three
+API constraints shaped the loop: forced `tool_choice` returns a 400 on this model (so `auto`, a strict submit tool and a
+prompt instruction; router mode's forced `classify` means `ANTHROPIC_MODEL` must not be set to this model for chat), the tool
+list stays constant during a run, and thinking blocks are passed back unchanged (`keep_thinking`, for this model only).
+
+### 19.5 Cases and decisions (`triage_store.py`)
+
+Status: open -> accepted | waived | escalated -> resolved. Accept writes one finding per region under the person's name
+(a finding has one region) but does not close the case; a stakeholder's agreement does not prove the cause. **Only a re-scan
+that no longer finds the problem resolves it**, and it auto-closes the matching findings. A problem that returns reopens
+with a new deadline. A waiver covers exactly the records it named. Reject needs a reason: `wrong_cause` -> development,
+`wrong_owner` -> the new owner, `action_refused` -> `TRIAGE_DECISION_OWNER`. `--sweep` escalates a missed deadline
+(`TRIAGE_RESPONSE_HOURS`, 24). Every change is in the append-only `triage_events`.
+
+Outcome cases are different: a week's sales are final, so a rerun cannot clear one. It closes when a later week's scan no
+longer flags that brand in that region. `auto_resolve` skips outcome findings for the same reason.
+
+Roles: `X-Role: stakeholder` or `analyst` may decide; `POST /findings` stays analyst only. A user who may see only part of a
+case sees those records, no evidence, and cannot decide it. The job runs with the read key and a read-only warehouse.
+
+### 19.6 Results (full table: evals/TRIAGE_RESULTS.md)
+
+Measured with `claude-sonnet-5-5`, 2026-11-01: 12 of 12 investigations named the planted cause and the right skus (6
+scenarios, 2 runs). On real demo data the scan found 24 failing records in 5 cases, all CONFIRMED, with 0 LLM calls, no false
+outcome alarm, and a repeat scan was silent. On clean weeks W35-W38 the outcome check raised no false alarm.
+
+**Read this before quoting the 12 of 12.**
+- An early version scored 4 of 5 with no sign of trouble in the method: **the agent called every tool at once in its first
+  step**, then answered. That is "run all the checks", not an investigation, and it proves nothing about agents. Only the
+  `substitute` scenario, added for this reason, needs a result before it can ask the next question: it followed the evidence
+  to the rival sku in both runs. In the other five, a fixed workflow plus one LLM call would probably do as well. Telling the
+  model not to run every tool made its order more sensible, but several tools still go out in one call, and model calls
+  varied from 2 to 4 between prompt versions with no change in the score, so they are not evidence of anything by themselves.
+- The scenarios and the cause list were written by the same person, and the prompt names the causes. A cause nobody has
+  seen, which is what the agent is for, is not measured. OTHER has not been tested.
+- 12 runs is small, and the eval reports on prompts revised after seeing the misses.
+
+Found by running it, not by tests:
+- The first gate let a false `STOCK_SHORTAGE` through: `on_hand` below a normal week is common by chance. A shortage now
+  needs the stock to have sold out.
+- A live run submitted the action "x". Actions under 20 characters are replaced by code's own text for that cause.
+- The generator was not reproducible despite its seed: `keep` iterated a set while drawing random numbers, so results
+  depended on Python's hash seed, and a test passed or failed from one process to the next. Fixed with `sorted(members)`.
+  `data/warehouse.duckdb` was not regenerated; a new one will differ from it.
+
+Known limits:
+- A fall in only some stores can vanish in a regional total: the rest of the region sells more at the new price. The check
+  misses these; the `pos` scenario shows it on one sku of three on freshly generated data.
+- The ladder in `validate_rows` requires a multipack's unit price to be at least the Single's, but section 2 calls "single x
+  6 below 6-pack price" an inconsistency, which is the opposite. Left as it is; decide which is intended. Because of it, the
+  cannibalization signal is "an override widened the per-unit gap", not "the pack became cheaper".
+- Ranking uses severity, units lost and record count, not stock value.
+- Not built: real notifications, parallel investigations, the rerun button (a person runs `infra/run_week.sh`), and
+  turning a confirmed cause into a rule (a person does that).
+
+---
+
 ## Appendix A. Interview talking points (short)
 
 - **System framing:** "SAP was the system of record: each week it provided the clearance
@@ -755,6 +918,16 @@ data-warehouse query or a distributed job instead.
 - **SAP push:** "Prices went out in batches with retries for transient errors and
   record-level status in Cloud SQL; a reconciliation step checked the prices actually active
   in SAP against what we sent."
+- **Why an agent, and where:** (simulator work, not a production claim) "Known errors have a code and a playbook, so a
+  template handles them. The agent is only for records that pass every check and still stop selling: there is no code, and
+  the next question can depend on the last answer. In my eval a competitor's promotion took the sales, and the agent had to
+  find that product before it could ask why. Honest result: 12 of 12 on planted causes, but in five of the six scenarios a
+  fixed workflow would have done as well, and my first version just ran every tool at once. It earns its place only for the
+  long tail, and it should shrink as confirmed causes become rules. If new problems become rare, I would turn it off."
+- **Why not multi-agent:** "The investigation is sequential and the tools are few. Specialist 'agents' here would just be
+  tools. For volume I would run the same agent on separate cases, not make agents talk to each other."
+- **High error volume:** "Volume of errors is not volume of investigations. Fifty thousand HTTP 503s are one case. If half
+  the records fail at once, a circuit breaker treats it as one incident instead of paying for a model call per case."
 - **Why an LLM:** "The diagnostic checks were deterministic and had to be. The LLM
   understood questions of many shapes, decided which checks to run and how to aggregate
   them, and combined results with playbooks to explain. If questions had been limited to a

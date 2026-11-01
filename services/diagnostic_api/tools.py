@@ -457,12 +457,13 @@ def _finish(name: str, result: dict, ctx: ToolContext, hit: bool) -> dict:
     return result
 
 
-def execute_tool(name: str, args: dict | None, ctx: ToolContext) -> tuple[dict, bool]:
-    """Run one allow-listed tool. Returns (result, is_error); never raises."""
+def execute_tool(name: str, args: dict | None, ctx: ToolContext, registry: dict | None = None) -> tuple[dict, bool]:
+    """Run one allow-listed tool. Returns (result, is_error); never raises. `registry` swaps the allow-list (the
+    triage agent's tools are not callable from chat)."""
     t0, args = time.perf_counter(), args or {}
     is_error = hit = False
     try:
-        fn = TOOLS.get(name)
+        fn = (TOOLS if registry is None else registry).get(name)
         if fn is None:
             raise ToolError(f"unknown tool {name!r}")
         if "ctx" in args:

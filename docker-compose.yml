@@ -44,6 +44,7 @@ services:
       SAP_READ_KEY: ${SAP_READ_KEY:-dev-read-key}   # never SAP_WRITE_KEY: this service cannot change a price
       DUCKDB_PATH: /data/warehouse.duckdb
       LLM_PROVIDER: ${LLM_PROVIDER:-scripted}       # scripted needs no key; anthropic needs ANTHROPIC_API_KEY below
+      AGENT_MODE: ${AGENT_MODE:-router}             # router: classify -> fixed workflow -> explain | loop: open tool use
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-haiku-4-5}
     ports: ["8000:8000"]
@@ -76,6 +77,24 @@ services:
       SAP_WRITE_KEY: ${SAP_WRITE_KEY:-dev-write-key}
       DUCKDB_PATH: /data/warehouse.duckdb     # BigQuery on GCP (WAREHOUSE=bigquery)
     volumes: ["./data:/data"]
+    depends_on:
+      mock-sap: {condition: service_started}
+
+  # Batch job after the pipeline: docker compose run --rm weekly-triage --week 2026-W39   (or infra/run_week.sh)
+  weekly-triage:
+    profiles: [jobs]
+    build:
+      context: .
+      dockerfile: jobs/weekly_triage/Dockerfile
+    environment:
+      DATABASE_URL: postgresql://pricing:pricing@postgres:5432/pricing
+      SAP_BASE_URL: http://mock-sap:8001
+      SAP_READ_KEY: ${SAP_READ_KEY:-dev-read-key}   # never SAP_WRITE_KEY: the scan cannot change a price
+      DUCKDB_PATH: /data/warehouse.duckdb
+      LLM_PROVIDER: ${LLM_PROVIDER:-scripted}       # scripted: the scan runs, without the LLM steps
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      TRIAGE_MODEL: ${TRIAGE_MODEL:-claude-sonnet-5-5}
+    volumes: ["./data:/data:ro"]
     depends_on:
       mock-sap: {condition: service_started}
 
