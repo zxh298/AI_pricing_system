@@ -1,0 +1,5 @@
+httpx
+psycopg[binary]
+anthropic
+fastembed
+duckdb==1.5.5    # pinned to match jobs/weekly_pipeline: both open the same warehouse.duckdb file

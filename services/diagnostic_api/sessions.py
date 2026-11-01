@@ -92,7 +92,7 @@ class SessionStore:
             con.close()                                             # closing the connection releases the lock
 
     def save_turn(self, session: dict, *, state: dict, history: list[dict], question: str, answer: str,
-                  tool_calls: list[dict], messages: list[dict]) -> int:
+                  tool_calls: list[dict], messages: list[dict], trace: dict | None = None) -> int:
         """Persist a finished turn. Raises VersionConflict if the session changed since `session` was read.
         Returns the new version, which is also the turn number."""
         now = self.clock()
@@ -104,10 +104,10 @@ class SessionStore:
             if row is None:
                 raise VersionConflict("the session changed while this message was processed; retry")
             con.execute(f"""INSERT INTO {self.s}.turn_transcripts
-                    (session_id, turn_no, user_id, question, answer, tool_calls, messages, created_at)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (session_id, turn_no, user_id, question, answer, tool_calls, messages, trace, created_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                         (session["session_id"], row["version"], session["user_id"], question, answer,
-                         Jsonb(tool_calls), Jsonb(messages), now))
+                         Jsonb(tool_calls), Jsonb(messages), Jsonb(trace) if trace is not None else None, now))
         return row["version"]
 
 

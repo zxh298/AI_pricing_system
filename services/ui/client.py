@@ -64,3 +64,26 @@ class ApiClient:
 
     def resolve_finding(self, finding_id: int) -> dict:
         return self._call("POST", f"/findings/{finding_id}/resolve")
+
+    def list_scans(self, week: str | None = None) -> list[dict]:
+        return self._call("GET", "/triage/scans", params={"week": week} if week else None)
+
+    def list_cases(self, week: str | None = None, status: str | None = None) -> list[dict]:
+        params = {k: v for k, v in {"week": week, "status": status}.items() if v}
+        return self._call("GET", "/triage/cases", params=params)
+
+    def get_case(self, case_id: int) -> dict:
+        return self._call("GET", f"/triage/cases/{case_id}")
+
+    def accept_case(self, case_id: int, note: str | None = None, ticket: str | None = None) -> dict:
+        return self._call("POST", f"/triage/cases/{case_id}/accept", json={"note": note, "ticket": ticket})
+
+    def waive_case(self, case_id: int, note: str) -> dict:
+        return self._call("POST", f"/triage/cases/{case_id}/waive", json={"note": note})
+
+    def reject_case(self, case_id: int, reason: str, note: str | None = None, new_owner: str | None = None) -> dict:
+        return self._call("POST", f"/triage/cases/{case_id}/reject",
+                          json={"reason": reason, "note": note, "new_owner": new_owner})
+
+    def list_notifications(self, week: str | None = None) -> list[dict]:
+        return self._call("GET", "/triage/notifications", params={"week": week} if week else None)

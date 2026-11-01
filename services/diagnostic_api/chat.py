@@ -13,6 +13,7 @@ import logging
 
 from services.diagnostic_api.agent import run_turn
 from services.diagnostic_api.llm import get_llm
+from services.diagnostic_api.router import run_router
 from services.diagnostic_api.tools import make_context
 from shared.config import load_config
 from shared.envfile import load_dotenv
@@ -27,15 +28,19 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--user", default="cli")
     ap.add_argument("--quiet", action="store_true", help="hide the tool call log")
     args = ap.parse_args(argv)
-    week = args.week or load_config().default_week
+    cfg = load_config()
+    week = args.week or cfg.default_week
     if not args.quiet:
         logging.basicConfig(level=logging.INFO, format="  tool> %(message)s")
         logging.getLogger("httpx").setLevel(logging.WARNING)
-    out = run_turn(args.question, make_context(args.user, run_id=args.run_id), get_llm(week), week)
+    turn_fn = run_router if cfg.agent_mode == "router" else run_turn
+    out = turn_fn(args.question, make_context(args.user, run_id=args.run_id), get_llm(week), week)
     print(f"\n{out['answer']}\n")
     print(f"[{out['steps']} model calls, {len(out['tool_calls'])} tool calls"
+          + (f", intent {out['intent']}, route {out['route']}" if "route" in out else "")
           + (", ESCALATED: step limit reached" if out["escalated"] else "")
-          + (", answer truncated at max_tokens" if out["truncated"] else "") + "]")
+          + (", answer truncated at max_tokens" if out["truncated"] else "")
+          + (f", UNVERIFIED: {', '.join(out['unverified'])}" if out.get("unverified") else "") + "]")
     return 0
 
 

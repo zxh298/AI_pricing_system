@@ -142,6 +142,29 @@ class KnowledgeBase:
                             "severity": row["severity"], "what_to_do": steps or None}
         return out
 
+    def playbook_sections(self, tags: list[str]) -> dict[str, dict]:
+        """For each tag, the playbook's id, owning team and severity plus the sections a triage proposal quotes
+        word for word. Tag lookup only, so it needs no embedding model."""
+        if not tags:
+            return {}
+        s = schema()
+        rows = self._rows(f"""SELECT d.doc_id, d.owner, d.severity, d.tags, c.section, c.text
+                              FROM {s}.docs d LEFT JOIN {s}.chunks c ON c.doc_id = d.doc_id
+                                   AND c.section = ANY(ARRAY['Why it happens', 'What to do', 'What not to do'])
+                              WHERE d.doc_type = 'playbook' AND d.tags && %s::text[]
+                              ORDER BY d.doc_id, c.chunk_no""", (tags,))
+        out = {}
+        for tag in tags:
+            own = [r for r in rows if tag in r["tags"]]
+            if own:
+                first = own[0]
+                text = lambda section: join_chunks([r["text"] for r in rows if r["doc_id"] == first["doc_id"]
+                                                    and r["section"] == section])
+                out[tag] = {"doc_id": first["doc_id"], "owner": first["owner"], "severity": first["severity"],
+                            "why": text("Why it happens"), "what_to_do": text("What to do"),
+                            "what_not_to_do": text("What not to do")}
+        return out
+
     def scores(self, query: str) -> list[dict]:
         """Every chunk with its similarity to the question, best first. Used to measure retrieval; search uses `similar`."""
         vec = vector_literal(self.embedder.embed_query(query))

@@ -32,11 +32,41 @@ class FakeApiClient:
     create_finding_result = {"finding_id": 1}
     create_finding_error = None
     resolve_finding_error = None
+    scans_result = []
+    cases_result = []
+    notifications_result = []
+    decide_error = None
 
     def __init__(self, base_url, user, role=None):
         self.base_url, self.user, self.role = base_url, user, role
         self.calls = []
         FakeApiClient.last_instance = self
+
+    def list_scans(self, week=None):
+        self.calls.append(("list_scans", week))
+        return FakeApiClient.scans_result
+
+    def list_cases(self, week=None, status=None):
+        self.calls.append(("list_cases", week, status))
+        return FakeApiClient.cases_result
+
+    def list_notifications(self, week=None):
+        self.calls.append(("list_notifications", week))
+        return FakeApiClient.notifications_result
+
+    def accept_case(self, case_id, note=None, ticket=None):
+        self.calls.append(("accept_case", case_id, note))
+        if FakeApiClient.decide_error:
+            raise FakeApiClient.decide_error
+        return {}
+
+    def waive_case(self, case_id, note):
+        self.calls.append(("waive_case", case_id, note))
+        return {}
+
+    def reject_case(self, case_id, reason, note=None, new_owner=None):
+        self.calls.append(("reject_case", case_id, reason, note, new_owner))
+        return {}
 
     def healthz(self):
         self.calls.append(("healthz",))
@@ -87,7 +117,8 @@ def reset(monkeypatch):
     st.cache_resource.clear()                                       # a stale cached client must never leak into a test
     for name, default in [("healthz_ok", True), ("create_session_error", None), ("get_session_error", None),
                           ("post_message_error", None), ("findings_result", []), ("findings_error", None),
-                          ("create_finding_error", None), ("resolve_finding_error", None)]:
+                          ("create_finding_error", None), ("resolve_finding_error", None),
+                          ("scans_result", []), ("cases_result", []), ("notifications_result", []), ("decide_error", None)]:
         setattr(FakeApiClient, name, default)
     FakeApiClient.create_session_result, FakeApiClient.get_session_result = SESSION, {**SESSION, "turns": 0, "groups": {}, "conversation": []}
     FakeApiClient.last_instance = None
@@ -209,6 +240,25 @@ def test_escalated_and_truncated_are_shown_as_warnings(reset):
     assert "escalated" in warnings and "cut off" in warnings
 
 
+def test_router_intent_route_fallback_and_unverified_values_are_shown(reset):
+    FakeApiClient.post_message_result = {"turn": 1, "answer": "...", "steps": 3, "tool_calls": [], "escalated": False,
+                                         "truncated": False, "intent": "other", "route": "fallback",
+                                         "unverified": ["999999", "PB-MADE-UP"]}
+    at = start_session(run())
+    at.chat_input[0].set_value("something unusual").run()
+    assert any("intent `other`" in c.value and "route `fallback`" in c.value for c in at.caption)
+    assert any("open-ended investigation" in i.value for i in at.info)
+    assert any("999999, PB-MADE-UP" in w.value for w in at.warning)
+
+
+def test_a_loop_mode_answer_shows_no_router_details(reset):
+    FakeApiClient.post_message_result = {"turn": 1, "answer": "an answer", "tool_calls": [], "steps": 1,
+                                         "escalated": False, "truncated": False}       # no intent, route or unverified
+    at = start_session(run())
+    at.chat_input[0].set_value("hi").run()
+    assert not any("intent `" in c.value for c in at.caption) and not at.info and not at.warning
+
+
 def test_a_409_turn_in_progress_gets_a_specific_message(reset):
     FakeApiClient.post_message_error = ApiError(409, "another message is already being processed")
     at = start_session(run())
@@ -305,3 +355,96 @@ def test_a_findings_list_error_does_not_crash_the_page(reset):
     at = run()
     assert not at.exception
     assert any("diagnostic-api unavailable" in e.value for e in at.error)
+
+
+# ======================= weekly triage ======================= #
+CASE = {"case_id": 7, "week": "2026-W39", "kind": "record", "error_code": "NOT_EFFECTIVE", "reason": "PROMOTION", "brand": None,
+        "regions": ["VIC"], "records": [{"sku": "100012", "pack_qty": 1, "region": "VIC", "detail": "effective 12.49"}], "record_count": 1,
+        "confidence": "CONFIRMED", "route": "business", "owner": "Promotions team", "status": "open", "proposed_reason": "A promotion overrides it.",
+        "proposed_action": "End it or keep it.", "do_not": "Do not resend.", "doc_id": "PB-PROMO-OVERRIDE", "investigation": None}
+SCAN = {"status": "OK", "outcome_week": "2026-W38", "summary": {"records_checked": 138, "records_failing": 12, "outcome_flagged": 2, "llm_steps": 1}}
+
+
+def test_a_week_with_no_scan_says_so(reset):
+    at = run()
+    assert any("No scan for this week" in c.value for c in at.caption)
+
+
+def test_a_case_shows_its_proposal_and_a_viewer_cannot_decide(reset):
+    FakeApiClient.scans_result, FakeApiClient.cases_result = [SCAN], [CASE]
+    at = run()
+    assert any("A promotion overrides it." in m.value for m in at.markdown)
+    assert any("Do not resend." in w.value for w in at.warning)
+    assert not any(b.label in ("Accept", "Reject") for b in at.button)
+
+
+def test_a_stakeholder_can_accept_and_is_told_it_is_not_closed(reset):
+    FakeApiClient.cases_result = [CASE]
+    at = run()
+    at.selectbox(key="role_select").select("stakeholder").run()
+    assert FakeApiClient.last_instance.role == "stakeholder"
+    at.button(key="accept-7").click().run()
+    assert ("accept_case", 7, None) in FakeApiClient.last_instance.calls
+    assert any("closes when a re-scan" in s.value for s in at.success)
+
+
+def test_a_rejection_sends_the_chosen_reason(reset):
+    FakeApiClient.cases_result = [CASE]
+    at = run()
+    at.selectbox(key="role_select").select("stakeholder").run()
+    at.selectbox(key="why-7").select("We cannot do this action").run()
+    at.text_input(key="note-7").set_value("the promotion is contracted").run()
+    at.button(key="reject-7").click().run()
+    assert ("reject_case", 7, "action_refused", "the promotion is contracted", None) in FakeApiClient.last_instance.calls
+
+
+def test_waiving_needs_a_note(reset):
+    FakeApiClient.cases_result = [CASE]
+    at = run()
+    at.selectbox(key="role_select").select("stakeholder").run()
+    assert at.button(key="waive-7").disabled
+
+
+def test_a_decided_case_offers_no_decision(reset):
+    FakeApiClient.cases_result = [{**CASE, "status": "accepted"}]
+    at = run()
+    at.selectbox(key="role_select").select("stakeholder").run()
+    assert not any(b.label == "Accept" for b in at.button)
+
+
+def test_a_partial_case_offers_no_decision(reset):
+    FakeApiClient.cases_result = [{**CASE, "partial": True}]
+    at = run()
+    at.selectbox(key="role_select").select("stakeholder").run()
+    assert any("only part of this case" in i.value for i in at.info) and not any(b.label == "Accept" for b in at.button)
+
+
+def test_the_breaker_is_announced(reset):
+    FakeApiClient.scans_result = [{**SCAN, "status": "BREAKER"}]
+    assert any("one incident" in e.value for e in run().error)
+
+
+def test_a_likely_reason_is_labelled_unproven_and_shows_the_trace(reset):
+    trace = {"status": "submitted", "ruled_out": ["tills match"], "not_verified": ["why"], "dropped": [{"cause": "OTHER"}],
+             "unverified": ["9.99"], "trace": [{"tool": "find_rising_products"}, {"tool": "get_sap_conditions"}]}
+    FakeApiClient.cases_result = [{**CASE, "confidence": "LIKELY", "investigation": trace}]
+    at = run()
+    assert any("Possible reason, not proven" in m.value for m in at.markdown)
+    assert any("find_rising_products → get_sap_conditions" in c.value for c in at.caption)
+    assert any("Dropped by code" in w.value for w in at.warning) and any("9.99" in w.value for w in at.warning)
+
+
+def test_the_evidence_is_shown_to_the_person_deciding(reset):
+    run_ = {"status": "submitted", "causes": [{"cause": "SUBSTITUTION", "evidence": ["100089 rose", "100089 is on promotion"]}]}
+    FakeApiClient.cases_result = [{**CASE, "confidence": "LIKELY", "investigation": run_}]
+    assert any("Evidence for SUBSTITUTION" in m.value and "100089 is on promotion" in m.value for m in run().markdown)
+
+
+def test_a_decision_error_is_shown(reset):
+    FakeApiClient.cases_result = [CASE]
+    FakeApiClient.decide_error = ApiError(409, "case 7 is accepted")
+    at = run()
+    at.selectbox(key="role_select").select("stakeholder").run()
+    at.button(key="accept-7").click().run()
+    assert any("case 7 is accepted" in e.value for e in at.error)
+

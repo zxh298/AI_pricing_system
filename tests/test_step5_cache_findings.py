@@ -424,7 +424,8 @@ def client(rig):
         rig.llms.append(llm)
         return llm
     app = create_app(SessionStore(clock=rig.now), llm_factory,
-                     lambda user, regions: rig.mk(user, regions, state=False), rig.runs, rig.cache, rig.findings)
+                     lambda user, regions: rig.mk(user, regions, state=False), rig.runs, rig.cache, rig.findings,
+                     mode="loop")                                  # the scripted steps drive the open loop
     with TestClient(app) as c:
         yield c
 

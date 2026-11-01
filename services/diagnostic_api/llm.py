@@ -1,9 +1,12 @@
 """LLM providers behind one interface, so the loop never depends on a vendor SDK.
 
-    create(system, tools, messages) -> {"content": [blocks], "stop_reason": str}
+    create(system, tools, messages, tool_choice=None) -> {"content": [blocks], "stop_reason": str}
 
 Blocks are plain dicts ({"type": "text" | "tool_use", ...}) so a conversation is JSON-serialisable
-(sessions persist it in Postgres later). Providers:
+(sessions persist it in Postgres later). `tool_choice` ({"type": "tool", "name": ...}) forces one tool, which the
+router uses to get a structured classification. There is no temperature: the Messages API rejects sampling
+parameters from API version 2026-10-21, so routing stability is measured by evals/routing.py, not configured.
+Providers:
     ScriptedLLM    replays canned responses: offline development and tests, no key, no network
     AnthropicLLM   Claude via the Anthropic API (LLM_PROVIDER=anthropic, key in ANTHROPIC_API_KEY)
 """
@@ -16,8 +19,12 @@ from typing import Callable, Protocol
 from shared.config import load_config
 
 
+RESULTS_HEADER = "Results (JSON):\n"          # the router's render message: question first, then this, then the JSON
+FALLBACK_BETA = "server-side-fallback-2026-07-01"
+
+
 class LLM(Protocol):
-    def create(self, system: str, tools: list[dict], messages: list[dict]) -> dict: ...
+    def create(self, system: str, tools: list[dict], messages: list[dict], tool_choice: dict | None = None) -> dict: ...
 
 
 # ---------------- scripted (offline) ----------------
@@ -36,8 +43,9 @@ class ScriptedLLM:
     def __init__(self, steps: list[list[dict] | Callable[[list[dict]], list[dict]]]):
         self.steps, self.calls, self._ids = list(steps), [], itertools.count(1)
 
-    def create(self, system, tools, messages):
-        self.calls.append({"system": system, "tools": tools, "messages": json.loads(json.dumps(messages))})
+    def create(self, system, tools, messages, tool_choice=None):
+        self.calls.append({"system": system, "tools": tools, "messages": json.loads(json.dumps(messages)),
+                           "tool_choice": tool_choice})
         if len(self.calls) > len(self.steps):
             raise RuntimeError("ScriptedLLM has no response left for this call")
         step = self.steps[len(self.calls) - 1]
@@ -79,24 +87,60 @@ def canonical_script(week: str, brand: str = "Brand A", regions: tuple[str, ...]
                         diagnose, follow_up, answer])
 
 
+def render_payload(messages: list[dict]) -> dict:
+    """The workflow result the router sent to the render step (for scripted steps)."""
+    return json.loads(messages[-1]["content"].split(RESULTS_HEADER, 1)[1])
+
+
+def scripted_router(week: str, brand: str = "Brand A", regions: tuple[str, ...] = ("VIC", "NSW")) -> ScriptedLLM:
+    """Router mode offline: classify every question as the canonical diagnosis, then write the answer from the
+    workflow's results only, standing in for the model's explanation."""
+    def answer(msgs):
+        steps = render_payload(msgs)["steps"]
+        d = next((s["result"] for s in steps if s["tool"] == "diagnose_batch"), None)
+        if d is None or "by_region" not in d:
+            return [text("The diagnosis could not be run: " + json.dumps(steps[-1]["result"] if steps else {}))]
+        lines = [f"{brand}, {week}: " + "; ".join(f"{r} {dict(c)}" for r, c in d["by_region"].items()) + "."]
+        lines += [f"{p['count']} x {p['code']} ({p['reason']}) in {p['region']}, e.g. {', '.join(p['sample_skus'])}"
+                  for p in d["patterns"]]
+        return [text("\n".join(lines))]
+
+    return ScriptedLLM([[tool_use("classify", {"intent": "diagnose", "week": week, "brand": brand,
+                                               "regions": list(regions)})], answer])
+
+
 # ---------------- Anthropic ----------------
 class AnthropicLLM:
-    def __init__(self, client=None, model: str | None = None, max_tokens: int = 4096):
+    """`effort`, `fallback` and `keep_thinking` are for the triage agent's model (get_triage_llm); chat leaves them
+    unset. A tool loop on that model must pass its thinking blocks back unchanged."""
+
+    def __init__(self, client=None, model: str | None = None, max_tokens: int = 4096, effort: str | None = None,
+                 fallback: bool = False, keep_thinking: bool = False):
         if client is None:
             import anthropic                       # only needed for the live provider
             client = anthropic.Anthropic()
-        self.client, self.max_tokens = client, max_tokens
+        self.client, self.max_tokens, self.effort, self.fallback = client, max_tokens, effort, fallback
+        self.keep_thinking = keep_thinking
         self.model = model or load_config().anthropic_model
 
-    def create(self, system, tools, messages):
-        r = self.client.messages.create(model=self.model, max_tokens=self.max_tokens, system=system,
-                                        tools=tools, messages=messages)
+    def create(self, system, tools, messages, tool_choice=None):
+        extra = ({"tools": tools} if tools else {}) | ({"tool_choice": tool_choice} if tool_choice else {})
+        if self.effort:
+            extra["output_config"] = {"effort": self.effort}
+        if self.fallback:                          # a refused request is retried server side on a fallback model
+            extra |= {"betas": [FALLBACK_BETA], "fallbacks": "default"}
+        api = self.client.beta.messages if self.fallback else self.client.messages
+        r = api.create(model=self.model, max_tokens=self.max_tokens, system=system, messages=messages, **extra)
         blocks = []
         for b in r.content:
             if b.type == "text":
                 blocks.append({"type": "text", "text": b.text})
             elif b.type == "tool_use":
                 blocks.append({"type": "tool_use", "id": b.id, "name": b.name, "input": b.input})
+            elif self.keep_thinking and b.type == "thinking":
+                blocks.append({"type": "thinking", "thinking": b.thinking, "signature": b.signature})
+            elif self.keep_thinking and b.type == "redacted_thinking":
+                blocks.append({"type": "redacted_thinking", "data": b.data})
         return {"content": blocks, "stop_reason": r.stop_reason}
 
 
@@ -105,5 +149,14 @@ def get_llm(week: str | None = None) -> LLM:
     if cfg.llm_provider == "anthropic":
         return AnthropicLLM()
     if cfg.llm_provider == "scripted":            # offline demo of the canonical investigation
-        return canonical_script(week or cfg.default_week)
+        script = scripted_router if cfg.agent_mode == "router" else canonical_script
+        return script(week or cfg.default_week)
     raise ValueError(f"unknown LLM_PROVIDER={cfg.llm_provider}")
+
+
+def get_triage_llm() -> LLM | None:
+    """The model behind the weekly triage. None offline: the scan still runs, without the LLM steps."""
+    cfg = load_config()
+    if cfg.llm_provider != "anthropic":
+        return None
+    return AnthropicLLM(model=cfg.triage_model, max_tokens=16000, effort="medium", fallback=True, keep_thinking=True)

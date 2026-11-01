@@ -18,6 +18,9 @@ from shared import db
 from shared.diagnostic_schema import schema
 
 
+OUTCOME_CODES = ("LOW_SELL_THROUGH",)
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -91,6 +94,8 @@ class FindingsStore:
         scope (its region and all its SKUs) and none of those records still fail with its code and reason."""
         checked, region_set, closed = set(skus), set(regions), []
         for f in self.list(week=week, status="open"):
+            if f["error_code"] in OUTCOME_CODES:                      # a record check says nothing about sales
+                continue
             if f["region"] not in region_set or not set(f["skus"]) <= checked:
                 continue                                              # the check did not cover this finding
             still = f"{f['error_code']}:{f['reason']}"

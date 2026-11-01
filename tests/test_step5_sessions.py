@@ -64,7 +64,8 @@ def api(env, monkeypatch):
         def latest(self, week):
             return {"run_id": env["run"], "status": "SUCCEEDED", "finished_at": None, "data_version": f"{env['run']}@t0"}
 
-    with TestClient(create_app(store, llm_factory, ctx_factory, runs=FakeRuns())) as client:
+    # the scripted steps here drive the open loop; router mode is tested in test_step9_router
+    with TestClient(create_app(store, llm_factory, ctx_factory, runs=FakeRuns(), mode="loop")) as client:
         rig.client, rig.env = client, env
         yield rig
 
@@ -97,7 +98,8 @@ def test_create_ask_and_read_back(api):
     assert len(sid) >= 32 and sid != start(api)                                   # server-generated and unguessable
     r = ask(api, sid, "how are prices?")
     assert r.status_code == 200
-    assert r.json() == {"turn": 1, "answer": "hello", "tool_calls": [], "steps": 1, "escalated": False, "truncated": False}
+    assert r.json() == {"turn": 1, "answer": "hello", "tool_calls": [], "steps": 1, "escalated": False, "truncated": False,
+                        "intent": None, "route": "loop", "unverified": []}
     s = api.client.get(f"/sessions/{sid}", headers=ALICE).json()
     assert s["week"] == WEEK and s["turns"] == 1
     assert s["conversation"] == [{"question": "how are prices?", "answer": "hello"}]

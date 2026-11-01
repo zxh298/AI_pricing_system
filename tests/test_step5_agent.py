@@ -219,6 +219,7 @@ def test_cli_runs_the_offline_demo(env, monkeypatch, capsys):
     monkeypatch.setattr(chat, "make_context", lambda user, run_id=None: seen.append(run_id) or env["ctx"])
     monkeypatch.setattr(chat, "load_dotenv", lambda *a: None)
     monkeypatch.setenv("LLM_PROVIDER", "scripted")
+    monkeypatch.setenv("AGENT_MODE", "loop")                    # the router demo is tested in test_step9_router
     assert chat.main([QUESTION, "--week", WEEK, "--run-id", "run-1", "--quiet"]) == 0
     assert seen == ["run-1"]
     out = capsys.readouterr().out

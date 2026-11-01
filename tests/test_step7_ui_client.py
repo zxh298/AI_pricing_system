@@ -106,3 +106,31 @@ def test_a_2xx_response_never_raises():
 
 def test_str_of_apierror_includes_both_fields():
     assert str(ApiError(404, "not found")) == "404: not found"
+
+
+# ======================= weekly triage ======================= #
+def test_triage_reads_and_decisions_hit_the_right_paths():
+    client = fake_api(echo_headers())
+    assert client.get_case(7)["path"] == "/triage/cases/7"
+    assert client.waive_case(7, "kept")["path"] == "/triage/cases/7/waive"
+    r = client.accept_case(7, "ok", "T-1")
+    assert (r["path"], json.loads(r["body"])) == ("/triage/cases/7/accept", {"note": "ok", "ticket": "T-1"})
+    r = client.reject_case(7, "wrong_owner", None, "Merchandising team")
+    assert json.loads(r["body"]) == {"reason": "wrong_owner", "note": None, "new_owner": "Merchandising team"}
+
+
+def test_triage_lists_send_only_the_filters_given():
+    seen = []
+
+    def handler(req):
+        seen.append(str(req.url))
+        return httpx.Response(200, json=[])
+
+    client = fake_api(handler)
+    client.list_cases("2026-W39", "all")
+    client.list_cases()
+    client.list_scans("2026-W39")
+    client.list_notifications()
+    assert seen == ["http://api/triage/cases?week=2026-W39&status=all", "http://api/triage/cases",
+                    "http://api/triage/scans?week=2026-W39", "http://api/triage/notifications"]
+

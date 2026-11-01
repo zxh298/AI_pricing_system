@@ -142,8 +142,8 @@ def build(seed: int = 42, max_clearance_weeks: int = MAX_CLEARANCE_WEEKS):
         wk = week_id(n)
         # --- who is on this week's list (SAP decides WHAT) ---
         # an item whose next week_no would exceed the limit is no longer listed (history stays)
-        keep = {k for k in members if age[k] + 2 <= max_clearance_weeks
-                and not (age[k] >= 2 and rng.random() < 0.1)}
+        keep = {k for k in sorted(members) if age[k] + 2 <= max_clearance_weeks       # sorted: the rng draws must not
+                and not (age[k] >= 2 and rng.random() < 0.1)}                        # follow set order (hash seed)
         marked = {k for k in ever if any(cur[(k, r)] < shelf[k] for r in REGIONS)}
         pool_s = [k for k in singles if k not in ever]
         pool_p = [k for k in keys if k[1] > 1 and k not in ever and (k[0], 1) in marked]

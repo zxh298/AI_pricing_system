@@ -33,3 +33,14 @@ class RunResolver:
         if row is None:
             return None
         return {**row, "data_version": f"{row['run_id']}@{row['finished_at'].isoformat()}"}
+
+    def newest_status(self, week: str) -> str | None:
+        """The status of the newest run of a week, finished or not. A FAILED run after a good one means the good one
+        no longer describes the week."""
+        try:
+            with db.connect(self.url) as con:
+                row = con.execute(f"""SELECT status FROM {schema()}.pipeline_runs WHERE week = %s
+                                      ORDER BY started_at DESC, run_id DESC LIMIT 1""", (week,)).fetchone()
+        except psycopg.errors.UndefinedTable:
+            return None
+        return row["status"] if row else None
