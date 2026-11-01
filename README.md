@@ -13,15 +13,6 @@ No employer code, data or internal documents are used anywhere in this repositor
 
 ## Architecture
 
-![Architecture: docker compose services, ports, volumes and external calls](architecture.png)
-
-*(source: `architecture.dot`, regenerate with `dot -Tpng -Gdpi=150 architecture.dot -o architecture.png`)*
-
-How a week is triaged: [triage_flow.png](triage_flow.png) *(source: `triage_flow.dot`)*. How the diagnostic agent
-handles one question (classify, validate, fixed workflow, render, check; and the
-open tool-use loop it falls back to): [agent_flow.png](agent_flow.png) *(source: `agent_flow.dot`,
-regenerate the same way)*
-
 - **The pricing side is deterministic.** A rule engine sets prices within SAP's floor, maximum markdown and
   ladder rules; an independent validation gate re-checks every rule before anything is sent, so a defect can
   never reach SAP.
